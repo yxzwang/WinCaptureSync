@@ -211,5 +211,8 @@ Recorder now prefers `Windows Graphics Capture (WGC)` for single-window/single-m
 - Cursor is captured by the system compositor pipeline (`IsCursorCaptureEnabled=true`)
 - Captured frame matches on-screen composition without application-side cursor repaint
 - `video_meta.json` includes `capture.backend` (`wgc` or `gdi`)
+- 默认使用 WGC 录制能录制到鼠标。
+- 某些游戏窗口录制支持可能不行，需要全屏后使用录制屏幕功能。
+- 为了保证游戏全屏中也能录制键盘鼠标输入，需要启动时开启管理员权限。
 
 If WGC is unavailable for the selected source, recorder falls back to the previous GDI path.
