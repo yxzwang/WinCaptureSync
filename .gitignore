@@ -1,0 +1,16 @@
+build/
+build-*/
+build-vs*/
+captures/
+dist/captures/
+dist/*.exe
+*.mp4
+*.jsonl
+*.user
+*.VC.db
+*.VC.opendb
+*.suo
+*.pdb
+*.obj
+*.ilk
+*.log
