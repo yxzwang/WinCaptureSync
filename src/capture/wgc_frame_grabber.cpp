@@ -288,19 +288,30 @@ bool WgcFrameGrabber::CopyLatestFrame(uint8_t* dst_bgra,
         return false;
     }
 
-    if (src_width != dst_width || src_height != dst_height) {
-        std::memset(dst_bgra, 0, static_cast<size_t>(dst_stride) * static_cast<size_t>(dst_height));
-    }
-
-    const uint32_t copy_width = (std::min)(src_width, dst_width);
-    const uint32_t copy_height = (std::min)(src_height, dst_height);
-    const uint32_t row_bytes = copy_width * 4;
-    for (uint32_t y = 0; y < copy_height; ++y) {
-        const auto* src_row = static_cast<const uint8_t*>(mapped.pData) +
-                              static_cast<size_t>(mapped.RowPitch) * static_cast<size_t>(y);
-        auto* dst_row =
-            dst_bgra + static_cast<size_t>(dst_stride) * static_cast<size_t>(y);
-        std::memcpy(dst_row, src_row, row_bytes);
+    const auto* src_base = static_cast<const uint8_t*>(mapped.pData);
+    if (src_width == dst_width && src_height == dst_height) {
+        const uint32_t row_bytes = src_width * 4;
+        for (uint32_t y = 0; y < src_height; ++y) {
+            const auto* src_row = src_base + static_cast<size_t>(mapped.RowPitch) * static_cast<size_t>(y);
+            auto* dst_row = dst_bgra + static_cast<size_t>(dst_stride) * static_cast<size_t>(y);
+            std::memcpy(dst_row, src_row, row_bytes);
+        }
+    } else {
+        // Scale during capture so the encoder only sees the target resolution.
+        for (uint32_t y = 0; y < dst_height; ++y) {
+            const uint32_t src_y =
+                static_cast<uint32_t>((static_cast<uint64_t>(y) * src_height) / dst_height);
+            const auto* src_row =
+                src_base + static_cast<size_t>(mapped.RowPitch) * static_cast<size_t>(src_y);
+            auto* dst_row = dst_bgra + static_cast<size_t>(dst_stride) * static_cast<size_t>(y);
+            for (uint32_t x = 0; x < dst_width; ++x) {
+                const uint32_t src_x =
+                    static_cast<uint32_t>((static_cast<uint64_t>(x) * src_width) / dst_width);
+                const auto* src_px = src_row + static_cast<size_t>(src_x) * 4;
+                auto* dst_px = dst_row + static_cast<size_t>(x) * 4;
+                std::memcpy(dst_px, src_px, 4);
+            }
+        }
     }
 
     d3d_context_->Unmap(staging_texture_.get(), 0);

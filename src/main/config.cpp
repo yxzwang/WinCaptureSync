@@ -125,29 +125,44 @@ bool ParseBool(const std::string& text, const bool default_value = false) {
 }  // namespace
 
 bool SaveDefaultConfig(const std::filesystem::path& path) {
+    return SaveConfig(path, AppConfig{});
+}
+
+bool SaveConfig(const std::filesystem::path& path, const AppConfig& config) {
     std::ofstream out(path, std::ios::binary | std::ios::out | std::ios::trunc);
     if (!out.is_open()) {
         return false;
     }
 
     out << "# WinCaptureSync config\n";
-    out << "hotkey_modifiers=CTRL+ALT\n";
-    out << "hotkey_vk=F9\n";
-    out << "capture_fps=60\n";
-    out << "capture_bitrate=12000000\n";
-    out << "capture_width=0\n";
-    out << "capture_height=0\n";
-    out << "capture_codec=h264\n";
-    out << "input_queue_capacity=32768\n";
-    out << "input_batch_size=512\n";
-    out << "input_flush_interval_ms=10\n";
-    out << "input_diagnostic_mode=0\n";
-    out << "output_root=captures\n";
+    out << "hotkey_modifiers=" << ModifiersToString(config.hotkey_modifiers) << "\n";
+    out << "hotkey_vk=" << VkToString(config.hotkey_vk) << "\n";
+    out << "capture_fps=" << config.capture_fps << "\n";
+    out << "capture_bitrate=" << config.capture_bitrate << "\n";
+    out << "capture_width=" << config.capture_width << "\n";
+    out << "capture_height=" << config.capture_height << "\n";
+    out << "capture_primary_width=" << config.capture_primary_width << "\n";
+    out << "capture_primary_height=" << config.capture_primary_height << "\n";
+    out << "capture_secondary_width=" << config.capture_secondary_width << "\n";
+    out << "capture_secondary_height=" << config.capture_secondary_height << "\n";
+    out << "capture_codec=" << CaptureCodecToString(config.capture_codec) << "\n";
+    out << "input_queue_capacity=" << config.input_queue_capacity << "\n";
+    out << "input_batch_size=" << config.input_batch_size << "\n";
+    out << "input_flush_interval_ms=" << config.input_flush_interval_ms << "\n";
+    out << "input_diagnostic_mode=" << (config.input_diagnostic_mode ? "1" : "0") << "\n";
+    out << "ui_source_mode=" << config.ui_source_mode << "\n";
+    out << "ui_primary_source_id=" << config.ui_primary_source_id << "\n";
+    out << "ui_secondary_source_id=" << config.ui_secondary_source_id << "\n";
+    out << "output_root=" << config.output_root.string() << "\n";
     return true;
 }
 
 AppConfig LoadConfig(const std::filesystem::path& path) {
     AppConfig cfg;
+    bool has_primary_width = false;
+    bool has_primary_height = false;
+    bool has_secondary_width = false;
+    bool has_secondary_height = false;
     if (!std::filesystem::exists(path)) {
         SaveDefaultConfig(path);
         return cfg;
@@ -185,6 +200,18 @@ AppConfig LoadConfig(const std::filesystem::path& path) {
                 cfg.capture_width = static_cast<uint32_t>(std::stoul(value));
             } else if (key == "CAPTURE_HEIGHT") {
                 cfg.capture_height = static_cast<uint32_t>(std::stoul(value));
+            } else if (key == "CAPTURE_PRIMARY_WIDTH") {
+                cfg.capture_primary_width = static_cast<uint32_t>(std::stoul(value));
+                has_primary_width = true;
+            } else if (key == "CAPTURE_PRIMARY_HEIGHT") {
+                cfg.capture_primary_height = static_cast<uint32_t>(std::stoul(value));
+                has_primary_height = true;
+            } else if (key == "CAPTURE_SECONDARY_WIDTH") {
+                cfg.capture_secondary_width = static_cast<uint32_t>(std::stoul(value));
+                has_secondary_width = true;
+            } else if (key == "CAPTURE_SECONDARY_HEIGHT") {
+                cfg.capture_secondary_height = static_cast<uint32_t>(std::stoul(value));
+                has_secondary_height = true;
             } else if (key == "CAPTURE_CODEC") {
                 cfg.capture_codec = ParseCaptureCodec(value);
             } else if (key == "INPUT_QUEUE_CAPACITY") {
@@ -195,6 +222,12 @@ AppConfig LoadConfig(const std::filesystem::path& path) {
                 cfg.input_flush_interval_ms = std::stoi(value);
             } else if (key == "INPUT_DIAGNOSTIC_MODE") {
                 cfg.input_diagnostic_mode = ParseBool(value, false);
+            } else if (key == "UI_SOURCE_MODE") {
+                cfg.ui_source_mode = std::stoi(value);
+            } else if (key == "UI_PRIMARY_SOURCE_ID") {
+                cfg.ui_primary_source_id = value;
+            } else if (key == "UI_SECONDARY_SOURCE_ID") {
+                cfg.ui_secondary_source_id = value;
             } else if (key == "OUTPUT_ROOT") {
                 cfg.output_root = value;
             }
@@ -208,6 +241,29 @@ AppConfig LoadConfig(const std::filesystem::path& path) {
     }
     if (cfg.hotkey_vk == 0) {
         cfg.hotkey_vk = VK_F9;
+    }
+    if (cfg.ui_source_mode != 0 && cfg.ui_source_mode != 1) {
+        cfg.ui_source_mode = 0;
+    }
+    if (cfg.ui_primary_source_id.empty()) {
+        cfg.ui_primary_source_id = "monitor_primary";
+    }
+    if (cfg.ui_secondary_source_id.empty()) {
+        cfg.ui_secondary_source_id = "none";
+    }
+
+    // Backward compatibility with older config.ini that used one global capture size.
+    if (!has_primary_width) {
+        cfg.capture_primary_width = cfg.capture_width;
+    }
+    if (!has_primary_height) {
+        cfg.capture_primary_height = cfg.capture_height;
+    }
+    if (!has_secondary_width) {
+        cfg.capture_secondary_width = cfg.capture_width;
+    }
+    if (!has_secondary_height) {
+        cfg.capture_secondary_height = cfg.capture_height;
     }
     return cfg;
 }

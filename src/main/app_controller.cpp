@@ -109,8 +109,6 @@ bool AppController::StartRecording() {
     wcs::capture::ScreenRecorder::Options capture_options{};
     capture_options.fps = config_.capture_fps;
     capture_options.bitrate = config_.capture_bitrate;
-    capture_options.width = config_.capture_width;
-    capture_options.height = config_.capture_height;
     capture_options.codec = ToEncoderCodec(config_.capture_codec);
 
     wcs::input::InputRecorder::Options input_options{};
@@ -124,6 +122,16 @@ bool AppController::StartRecording() {
     for (size_t i = 0; i < sources.size(); ++i) {
         auto recorder = std::make_unique<wcs::capture::ScreenRecorder>();
         auto source_capture_options = capture_options;
+        if (i == 0) {
+            source_capture_options.width = config_.capture_primary_width;
+            source_capture_options.height = config_.capture_primary_height;
+        } else if (i == 1) {
+            source_capture_options.width = config_.capture_secondary_width;
+            source_capture_options.height = config_.capture_secondary_height;
+        } else {
+            source_capture_options.width = config_.capture_primary_width;
+            source_capture_options.height = config_.capture_primary_height;
+        }
         source_capture_options.source = sources[i];
         source_capture_options.sources.clear();
         source_capture_options.sources.push_back(sources[i]);
@@ -196,6 +204,20 @@ void AppController::SetCaptureSources(const std::vector<wcs::capture::CaptureSou
 
 void AppController::SetCaptureCodec(const CaptureCodec codec) {
     config_.capture_codec = codec;
+}
+
+void AppController::SetCaptureResolutions(const uint32_t primary_width,
+                                          const uint32_t primary_height,
+                                          const uint32_t secondary_width,
+                                          const uint32_t secondary_height) {
+    config_.capture_primary_width = primary_width;
+    config_.capture_primary_height = primary_height;
+    config_.capture_secondary_width = secondary_width;
+    config_.capture_secondary_height = secondary_height;
+
+    // Keep legacy config fields in sync for backward compatibility.
+    config_.capture_width = primary_width;
+    config_.capture_height = primary_height;
 }
 
 void AppController::SetInputDiagnosticMode(const bool enabled) {

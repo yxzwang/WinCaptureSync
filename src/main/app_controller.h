@@ -37,6 +37,10 @@ public:
 
     void SetCaptureSources(const std::vector<wcs::capture::CaptureSource>& sources);
     void SetCaptureCodec(CaptureCodec codec);
+    void SetCaptureResolutions(uint32_t primary_width,
+                               uint32_t primary_height,
+                               uint32_t secondary_width,
+                               uint32_t secondary_height);
     void SetInputDiagnosticMode(bool enabled);
     CaptureCodec GetCaptureCodec() const { return config_.capture_codec; }
     bool GetInputDiagnosticMode() const { return config_.input_diagnostic_mode; }

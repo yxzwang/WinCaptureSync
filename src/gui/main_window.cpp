@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iomanip>
+#include <iterator>
 #include <sstream>
 #include <string>
 
@@ -18,10 +20,70 @@ constexpr int kIdWindowPrimaryCombo = 1002;
 constexpr int kIdWindowSecondaryCombo = 1007;
 constexpr int kIdCodecCombo = 1008;
 constexpr int kIdDiagnosticCheck = 1009;
+constexpr int kIdPrimaryResolutionCombo = 1010;
+constexpr int kIdSecondaryResolutionCombo = 1011;
 constexpr int kIdRefreshBtn = 1003;
 constexpr int kIdStartStopBtn = 1004;
 constexpr int kIdStatusLabel = 1005;
 constexpr int kIdHotkeyLabel = 1006;
+constexpr char kSourceIdNone[] = "none";
+constexpr char kSourceIdMonitorPrimary[] = "monitor_primary";
+
+struct ResolutionPreset {
+    const wchar_t* label = L"";
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+constexpr ResolutionPreset kResolutionPresets[] = {
+    {L"Native", 0, 0},
+    {L"3840 x 2160", 3840, 2160},
+    {L"1920 x 1080", 1920, 1080},
+    {L"1280 x 720", 1280, 720},
+};
+
+std::wstring BuildDurationText(const ULONGLONG total_seconds) {
+    const ULONGLONG hours = total_seconds / 3600;
+    const ULONGLONG minutes = (total_seconds % 3600) / 60;
+    const ULONGLONG seconds = total_seconds % 60;
+    std::wstringstream ss;
+    ss << std::setfill(L'0') << std::setw(2) << hours << L":" << std::setw(2) << minutes << L":"
+       << std::setw(2) << seconds;
+    return ss.str();
+}
+
+std::string WideToUtf8(const std::wstring& wide) {
+    if (wide.empty()) {
+        return {};
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        return {};
+    }
+
+    std::string utf8(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), utf8.data(), size,
+                        nullptr, nullptr);
+    return utf8;
+}
+
+std::string MonitorSourceId(const MonitorEntry& entry) {
+    if (entry.is_primary) {
+        return kSourceIdMonitorPrimary;
+    }
+    if (!entry.device_name.empty()) {
+        return "monitor_device:" + WideToUtf8(entry.device_name);
+    }
+    std::stringstream ss;
+    ss << "monitor_rect:" << entry.rect.left << "," << entry.rect.top << "," << entry.rect.right << ","
+       << entry.rect.bottom;
+    return ss.str();
+}
+
+std::string WindowSourceId(const WindowEntry& entry) {
+    return "window_title:" + WideToUtf8(entry.title);
+}
 
 bool IsValidRect(const RECT& rect) {
     return rect.right > rect.left && rect.bottom > rect.top;
@@ -325,12 +387,11 @@ LRESULT MainWindow::HandleMessage(const UINT msg, const WPARAM w_param, const LP
                         UpdateStatus(L"Please select at least one source");
                         return 0;
                     }
-                    controller_.SetCaptureSources(sources);
-                    controller_.SetCaptureCodec(CurrentCodecFromUi());
-                    controller_.SetInputDiagnosticMode(
-                        SendMessageW(diagnostic_check_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    ApplyUiOptionsToController();
                 }
+                const auto prev_state = controller_.State();
                 controller_.ToggleRecording();
+                SyncRecordingDuration(prev_state, controller_.State());
                 UpdateControlState();
                 UpdateStatus(controller_.StatusText());
                 UpdatePreviewPipeline();
@@ -354,7 +415,8 @@ void MainWindow::OnCreate() {
                  reinterpret_cast<LPARAM>(L"Primary Monitor"));
     SendMessageW(source_mode_combo_, CB_ADDSTRING, 0,
                  reinterpret_cast<LPARAM>(L"Window / Monitor"));
-    SendMessageW(source_mode_combo_, CB_SETCURSEL, 0, 0);
+    const LRESULT initial_mode = (config_.ui_source_mode == 1) ? 1 : 0;
+    SendMessageW(source_mode_combo_, CB_SETCURSEL, initial_mode, 0);
 
     CreateWindowExW(0, L"STATIC", L"Codec", WS_CHILD | WS_VISIBLE, 12, 46, 56, 24, hwnd_, nullptr,
                     instance_, nullptr);
@@ -369,7 +431,7 @@ void MainWindow::OnCreate() {
                  config_.capture_codec == wcs::mainapp::CaptureCodec::HEVC ? 1 : 0, 0);
     diagnostic_check_ =
         CreateWindowExW(0, L"BUTTON", L"Input Diagnostic", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                        236, 44, 150, 24, hwnd_,
+                        72, 72, 170, 24, hwnd_,
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdDiagnosticCheck)), instance_,
                         nullptr);
     SendMessageW(diagnostic_check_, BM_SETCHECK,
@@ -381,6 +443,16 @@ void MainWindow::OnCreate() {
         0, L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 300, 10,
         300, 300, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdWindowPrimaryCombo)),
         instance_, nullptr);
+    resolution_primary_label_ = CreateWindowExW(0, L"STATIC", L"Res 1", WS_CHILD | WS_VISIBLE, 260,
+                                                46, 40, 24, hwnd_, nullptr, instance_, nullptr);
+    resolution_primary_combo_ = CreateWindowExW(
+        0, L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 300, 44, 120,
+        140, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdPrimaryResolutionCombo)),
+        instance_, nullptr);
+    for (const auto& preset : kResolutionPresets) {
+        SendMessageW(resolution_primary_combo_, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(preset.label));
+    }
 
     CreateWindowExW(0, L"STATIC", L"Window 2", WS_CHILD | WS_VISIBLE, 606, 12, 62, 24, hwnd_,
                     nullptr, instance_, nullptr);
@@ -388,6 +460,23 @@ void MainWindow::OnCreate() {
         0, L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 670, 10,
         300, 300, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdWindowSecondaryCombo)),
         instance_, nullptr);
+    resolution_secondary_label_ = CreateWindowExW(0, L"STATIC", L"Res 2", WS_CHILD | WS_VISIBLE,
+                                                  630, 46, 40, 24, hwnd_, nullptr, instance_, nullptr);
+    resolution_secondary_combo_ = CreateWindowExW(
+        0, L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 670, 44, 120,
+        140, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdSecondaryResolutionCombo)),
+        instance_, nullptr);
+    for (const auto& preset : kResolutionPresets) {
+        SendMessageW(resolution_secondary_combo_, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(preset.label));
+    }
+
+    SendMessageW(resolution_primary_combo_, CB_SETCURSEL,
+                 ResolutionPresetIndex(config_.capture_primary_width, config_.capture_primary_height),
+                 0);
+    SendMessageW(
+        resolution_secondary_combo_, CB_SETCURSEL,
+        ResolutionPresetIndex(config_.capture_secondary_width, config_.capture_secondary_height), 0);
 
     refresh_button_ = CreateWindowExW(0, L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                        760, 44, 96, 24, hwnd_,
@@ -400,10 +489,17 @@ void MainWindow::OnCreate() {
                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStartStopBtn)), instance_,
                         nullptr);
 
-    hotkey_label_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 12, 72, 460, 24, hwnd_,
+    recording_duration_label_ =
+        CreateWindowExW(0, L"STATIC", L"Rec Time", WS_CHILD | WS_VISIBLE, 480, 72, 70, 24, hwnd_,
+                        nullptr, instance_, nullptr);
+    recording_duration_value_ =
+        CreateWindowExW(0, L"STATIC", L"00:00:00", WS_CHILD | WS_VISIBLE, 552, 72, 120, 24, hwnd_,
+                        nullptr, instance_, nullptr);
+
+    hotkey_label_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 12, 100, 460, 24, hwnd_,
                                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdHotkeyLabel)),
                                     instance_, nullptr);
-    status_label_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 480, 72, 472, 24, hwnd_,
+    status_label_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 480, 100, 472, 24, hwnd_,
                                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatusLabel)),
                                     instance_, nullptr);
 
@@ -411,6 +507,7 @@ void MainWindow::OnCreate() {
     const auto hotkey_ascii = wcs::mainapp::HotkeyToString(config_.hotkey_modifiers, config_.hotkey_vk);
     hotkey_text.append(hotkey_ascii.begin(), hotkey_ascii.end());
     SetWindowTextW(hotkey_label_, hotkey_text.c_str());
+    UpdateRecordingDurationText(true);
 
     RebuildWindowList();
 
@@ -430,6 +527,7 @@ void MainWindow::OnDestroy() {
         KillTimer(hwnd_, preview_timer_);
         preview_timer_ = 0;
     }
+    SaveUiState();
     ReleaseDwmThumbnail();
     controller_.Shutdown();
     ReleasePreviewBuffer();
@@ -438,22 +536,31 @@ void MainWindow::OnDestroy() {
 
 void MainWindow::OnSize(const int width, const int height) {
     const int margin = 12;
-    const int top_controls_h = 104;
+    const int top_controls_h = 132;
+    const int resolution_combo_width = 120;
 
     MoveWindow(source_mode_combo_, 72, 10, 150, 300, TRUE);
     MoveWindow(codec_combo_, 72, 44, 150, 240, TRUE);
-    MoveWindow(diagnostic_check_, 236, 44, 150, 24, TRUE);
+    MoveWindow(diagnostic_check_, 72, 72, 170, 24, TRUE);
     const int windows_left = 300;
     const int windows_total = (std::max)(220, width - windows_left - margin);
     const int each_window_width = (std::max)(110, (windows_total - 8) / 2);
     MoveWindow(window_primary_combo_, windows_left, 10, each_window_width, 300, TRUE);
     MoveWindow(window_secondary_combo_, windows_left + each_window_width + 8, 10,
                each_window_width, 300, TRUE);
+    MoveWindow(resolution_primary_label_, windows_left - 40, 46, 40, 24, TRUE);
+    MoveWindow(resolution_primary_combo_, windows_left, 44, resolution_combo_width, 180, TRUE);
+    MoveWindow(resolution_secondary_label_, windows_left + each_window_width + 8 - 40, 46, 40, 24,
+               TRUE);
+    MoveWindow(resolution_secondary_combo_, windows_left + each_window_width + 8, 44,
+               resolution_combo_width, 180, TRUE);
     const int right_x = width - margin;
     MoveWindow(refresh_button_, right_x - 104 - 96, 44, 96, 24, TRUE);
     MoveWindow(start_stop_button_, right_x - 104, 44, 104, 24, TRUE);
-    MoveWindow(hotkey_label_, margin, 72, (std::max)(200, width / 2 - margin), 24, TRUE);
-    MoveWindow(status_label_, width / 2, 72, (std::max)(180, width / 2 - margin), 24, TRUE);
+    MoveWindow(recording_duration_label_, width / 2, 72, 70, 24, TRUE);
+    MoveWindow(recording_duration_value_, width / 2 + 72, 72, 120, 24, TRUE);
+    MoveWindow(hotkey_label_, margin, 100, (std::max)(200, width / 2 - margin), 24, TRUE);
+    MoveWindow(status_label_, width / 2, 100, (std::max)(180, width / 2 - margin), 24, TRUE);
 
     preview_rect_.left = margin;
     preview_rect_.top = top_controls_h + margin;
@@ -524,6 +631,8 @@ void MainWindow::OnPaint() {
 }
 
 void MainWindow::OnTimer() {
+    UpdateRecordingDurationText(false);
+
     const auto state = controller_.State();
     if (state == wcs::mainapp::RecorderState::Recording ||
         state == wcs::mainapp::RecorderState::Stopping) {
@@ -554,12 +663,11 @@ void MainWindow::OnCommand(const WPARAM w_param, const LPARAM) {
                 UpdateStatus(L"Please select at least one source");
                 return;
             }
-            controller_.SetCaptureSources(sources);
-            controller_.SetCaptureCodec(CurrentCodecFromUi());
-            controller_.SetInputDiagnosticMode(
-                SendMessageW(diagnostic_check_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            ApplyUiOptionsToController();
         }
+        const auto prev_state = controller_.State();
         controller_.ToggleRecording();
+        SyncRecordingDuration(prev_state, controller_.State());
         UpdateControlState();
         UpdateStatus(controller_.StatusText());
         UpdatePreviewPipeline();
@@ -583,6 +691,16 @@ void MainWindow::OnCommand(const WPARAM w_param, const LPARAM) {
         }
         return;
     }
+    if ((id == kIdPrimaryResolutionCombo || id == kIdSecondaryResolutionCombo) &&
+        code == CBN_SELCHANGE) {
+        if (controller_.State() == wcs::mainapp::RecorderState::Idle) {
+            const auto primary = ResolutionFromCombo(resolution_primary_combo_);
+            const auto secondary = ResolutionFromCombo(resolution_secondary_combo_);
+            controller_.SetCaptureResolutions(primary.first, primary.second, secondary.first,
+                                              secondary.second);
+        }
+        return;
+    }
     if (id == kIdWindowPrimaryCombo && code == CBN_SELCHANGE) {
         UpdateControlState();
         UpdatePreviewPipeline();
@@ -595,7 +713,206 @@ void MainWindow::OnCommand(const WPARAM w_param, const LPARAM) {
     }
 }
 
+void MainWindow::SyncRecordingDuration(const wcs::mainapp::RecorderState prev_state,
+                                       const wcs::mainapp::RecorderState current_state) {
+    const bool was_recording = (prev_state == wcs::mainapp::RecorderState::Recording ||
+                                prev_state == wcs::mainapp::RecorderState::Stopping);
+    const bool is_recording = (current_state == wcs::mainapp::RecorderState::Recording ||
+                               current_state == wcs::mainapp::RecorderState::Stopping);
+
+    if (!was_recording && is_recording) {
+        recording_duration_start_ms_ = GetTickCount64();
+        recording_duration_last_seconds_ = static_cast<ULONGLONG>(-1);
+        UpdateRecordingDurationText(true);
+        return;
+    }
+
+    if (was_recording && !is_recording) {
+        recording_duration_start_ms_ = 0;
+        recording_duration_last_seconds_ = static_cast<ULONGLONG>(-1);
+        UpdateRecordingDurationText(true);
+    }
+}
+
+void MainWindow::UpdateRecordingDurationText(const bool force) {
+    if (recording_duration_value_ == nullptr) {
+        return;
+    }
+
+    ULONGLONG elapsed_seconds = 0;
+    const auto state = controller_.State();
+    if (recording_duration_start_ms_ > 0 &&
+        (state == wcs::mainapp::RecorderState::Recording ||
+         state == wcs::mainapp::RecorderState::Stopping)) {
+        const ULONGLONG now_ms = GetTickCount64();
+        if (now_ms > recording_duration_start_ms_) {
+            elapsed_seconds = (now_ms - recording_duration_start_ms_) / 1000;
+        }
+    }
+
+    if (!force && elapsed_seconds == recording_duration_last_seconds_) {
+        return;
+    }
+    recording_duration_last_seconds_ = elapsed_seconds;
+    const std::wstring text = BuildDurationText(elapsed_seconds);
+    SetWindowTextW(recording_duration_value_, text.c_str());
+}
+
+void MainWindow::ApplyUiOptionsToController() {
+    controller_.SetCaptureSources(CurrentSourcesFromUi());
+    controller_.SetCaptureCodec(CurrentCodecFromUi());
+    controller_.SetInputDiagnosticMode(
+        SendMessageW(diagnostic_check_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    const auto primary = ResolutionFromCombo(resolution_primary_combo_);
+    const auto secondary = ResolutionFromCombo(resolution_secondary_combo_);
+    controller_.SetCaptureResolutions(primary.first, primary.second, secondary.first, secondary.second);
+}
+
+std::string MainWindow::SourceIdFromPrimaryIndex(const int index) const {
+    if (index < 0) {
+        return {};
+    }
+    const size_t idx = static_cast<size_t>(index);
+    if (idx < monitors_.size()) {
+        return MonitorSourceId(monitors_[idx]);
+    }
+    const size_t window_index = idx - monitors_.size();
+    if (window_index < windows_.size()) {
+        return WindowSourceId(windows_[window_index]);
+    }
+    return {};
+}
+
+std::string MainWindow::SourceIdFromSecondaryIndex(const int index) const {
+    if (index <= 0) {
+        return kSourceIdNone;
+    }
+    return SourceIdFromPrimaryIndex(index - 1);
+}
+
+int MainWindow::FindPrimaryIndexBySourceId(const std::string& source_id) const {
+    if (source_id.empty()) {
+        return -1;
+    }
+    if (source_id == kSourceIdMonitorPrimary) {
+        for (size_t i = 0; i < monitors_.size(); ++i) {
+            if (monitors_[i].is_primary) {
+                return static_cast<int>(i);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < monitors_.size(); ++i) {
+        if (MonitorSourceId(monitors_[i]) == source_id) {
+            return static_cast<int>(i);
+        }
+    }
+    for (size_t i = 0; i < windows_.size(); ++i) {
+        if (WindowSourceId(windows_[i]) == source_id) {
+            return static_cast<int>(monitors_.size() + i);
+        }
+    }
+    return -1;
+}
+
+int MainWindow::FindSecondaryIndexBySourceId(const std::string& source_id) const {
+    if (source_id.empty() || source_id == kSourceIdNone) {
+        return 0;
+    }
+    const int primary_index = FindPrimaryIndexBySourceId(source_id);
+    if (primary_index < 0) {
+        return 0;
+    }
+    return primary_index + 1;
+}
+
+void MainWindow::RestoreUiStateFromConfig() {
+    if (resolution_primary_combo_ != nullptr) {
+        SendMessageW(
+            resolution_primary_combo_, CB_SETCURSEL,
+            ResolutionPresetIndex(config_.capture_primary_width, config_.capture_primary_height), 0);
+    }
+    if (resolution_secondary_combo_ != nullptr) {
+        SendMessageW(resolution_secondary_combo_, CB_SETCURSEL,
+                     ResolutionPresetIndex(config_.capture_secondary_width,
+                                           config_.capture_secondary_height),
+                     0);
+    }
+
+    const int selectable_count = static_cast<int>(monitors_.size() + windows_.size());
+    if (selectable_count <= 0) {
+        SendMessageW(window_secondary_combo_, CB_SETCURSEL, 0, 0);
+        return;
+    }
+
+    int primary_index = FindPrimaryIndexBySourceId(config_.ui_primary_source_id);
+    if (primary_index < 0) {
+        primary_index = 0;
+    }
+    SendMessageW(window_primary_combo_, CB_SETCURSEL, primary_index, 0);
+
+    int secondary_index = FindSecondaryIndexBySourceId(config_.ui_secondary_source_id);
+    const int secondary_max = selectable_count;
+    if (secondary_index < 0 || secondary_index > secondary_max) {
+        secondary_index = 0;
+    }
+    SendMessageW(window_secondary_combo_, CB_SETCURSEL, secondary_index, 0);
+}
+
+void MainWindow::SaveUiState() {
+    if (source_mode_combo_ == nullptr || codec_combo_ == nullptr || diagnostic_check_ == nullptr ||
+        window_primary_combo_ == nullptr || window_secondary_combo_ == nullptr ||
+        resolution_primary_combo_ == nullptr || resolution_secondary_combo_ == nullptr) {
+        return;
+    }
+
+    config_.capture_codec = CurrentCodecFromUi();
+    const auto primary_resolution = ResolutionFromCombo(resolution_primary_combo_);
+    const auto secondary_resolution = ResolutionFromCombo(resolution_secondary_combo_);
+    config_.capture_primary_width = primary_resolution.first;
+    config_.capture_primary_height = primary_resolution.second;
+    config_.capture_secondary_width = secondary_resolution.first;
+    config_.capture_secondary_height = secondary_resolution.second;
+    // Keep legacy fields for backward compatibility with older versions.
+    config_.capture_width = primary_resolution.first;
+    config_.capture_height = primary_resolution.second;
+    config_.input_diagnostic_mode = (SendMessageW(diagnostic_check_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    config_.ui_source_mode = static_cast<int>(SendMessageW(source_mode_combo_, CB_GETCURSEL, 0, 0));
+    if (config_.ui_source_mode != 1) {
+        config_.ui_source_mode = 0;
+    }
+
+    const int primary_index = static_cast<int>(SendMessageW(window_primary_combo_, CB_GETCURSEL, 0, 0));
+    const std::string primary_id = SourceIdFromPrimaryIndex(primary_index);
+    config_.ui_primary_source_id = primary_id.empty() ? kSourceIdMonitorPrimary : primary_id;
+
+    const int secondary_index =
+        static_cast<int>(SendMessageW(window_secondary_combo_, CB_GETCURSEL, 0, 0));
+    const std::string secondary_id = SourceIdFromSecondaryIndex(secondary_index);
+    config_.ui_secondary_source_id = secondary_id.empty() ? kSourceIdNone : secondary_id;
+
+    wcs::mainapp::SaveConfig("config.ini", config_);
+}
+
 void MainWindow::RebuildWindowList() {
+    std::string preferred_primary_id = config_.ui_primary_source_id;
+    std::string preferred_secondary_id = config_.ui_secondary_source_id;
+    if (window_primary_combo_ != nullptr && window_secondary_combo_ != nullptr) {
+        const int current_primary =
+            static_cast<int>(SendMessageW(window_primary_combo_, CB_GETCURSEL, 0, 0));
+        const std::string current_primary_id = SourceIdFromPrimaryIndex(current_primary);
+        if (!current_primary_id.empty()) {
+            preferred_primary_id = current_primary_id;
+        }
+
+        const int current_secondary =
+            static_cast<int>(SendMessageW(window_secondary_combo_, CB_GETCURSEL, 0, 0));
+        const std::string current_secondary_id = SourceIdFromSecondaryIndex(current_secondary);
+        if (!current_secondary_id.empty()) {
+            preferred_secondary_id = current_secondary_id;
+        }
+    }
+
     monitors_ = EnumerateMonitors();
     windows_ = EnumerateRecordableWindows(hwnd_);
     SendMessageW(window_primary_combo_, CB_RESETCONTENT, 0, 0);
@@ -614,11 +931,9 @@ void MainWindow::RebuildWindowList() {
         SendMessageW(window_secondary_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
     }
 
-    const size_t selectable_count = monitors_.size() + windows_.size();
-    if (selectable_count > 0) {
-        SendMessageW(window_primary_combo_, CB_SETCURSEL, 0, 0);
-    }
-    SendMessageW(window_secondary_combo_, CB_SETCURSEL, 0, 0);
+    config_.ui_primary_source_id = preferred_primary_id;
+    config_.ui_secondary_source_id = preferred_secondary_id;
+    RestoreUiStateFromConfig();
     UpdateControlState();
 }
 
@@ -632,6 +947,8 @@ void MainWindow::UpdateControlState() {
     EnableWindow(source_mode_combo_, !is_recording);
     EnableWindow(codec_combo_, !is_recording);
     EnableWindow(diagnostic_check_, !is_recording);
+    EnableWindow(resolution_primary_combo_, !is_recording);
+    EnableWindow(resolution_secondary_combo_, !is_recording && window_mode);
     EnableWindow(window_primary_combo_, !is_recording && window_mode);
     EnableWindow(window_secondary_combo_, !is_recording && window_mode);
     EnableWindow(refresh_button_, !is_recording && window_mode);
@@ -851,6 +1168,27 @@ wcs::capture::CaptureSource BuildWindowSourceFromIndex(const std::vector<WindowE
         source.window_title = windows[window_index].title;
     }
     return source;
+}
+
+int MainWindow::ResolutionPresetIndex(const uint32_t width, const uint32_t height) const {
+    for (size_t i = 0; i < std::size(kResolutionPresets); ++i) {
+        if (kResolutionPresets[i].width == width && kResolutionPresets[i].height == height) {
+            return static_cast<int>(i);
+        }
+    }
+    return 0;
+}
+
+std::pair<uint32_t, uint32_t> MainWindow::ResolutionFromCombo(HWND combo) const {
+    if (combo == nullptr) {
+        return {0, 0};
+    }
+    const LRESULT idx = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    if (idx < 0 || idx >= static_cast<LRESULT>(std::size(kResolutionPresets))) {
+        return {0, 0};
+    }
+    const auto& preset = kResolutionPresets[idx];
+    return {preset.width, preset.height};
 }
 
 wcs::mainapp::CaptureCodec MainWindow::CurrentCodecFromUi() const {
