@@ -8,6 +8,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC)
     # Use static MSVC runtime (/MT, /MTd) to simplify single-file distribution.
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    # Require elevation (UAC prompt) for all generated executables.
+    set(CMAKE_EXE_LINKER_FLAGS
+        "${CMAKE_EXE_LINKER_FLAGS} /MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"")
 endif()
 
 add_compile_definitions(
