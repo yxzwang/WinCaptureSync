@@ -13,6 +13,11 @@ enum class InputEventType {
     MouseDown,
     MouseUp,
     Wheel,
+    GamepadConnected,
+    GamepadDisconnected,
+    GamepadButtonDown,
+    GamepadButtonUp,
+    GamepadAxis,
     Stats
 };
 
@@ -42,6 +47,11 @@ struct InputEvent {
     std::string button;
     int32_t wheel_delta = 0;
     bool injected = false;
+    int32_t gamepad_index = -1;
+    uint32_t gamepad_packet = 0;
+    std::string gamepad_control;
+    int32_t gamepad_value = 0;
+    int32_t gamepad_prev_value = 0;
 
     int64_t input_start_qpc = 0;
     int64_t qpc_freq = 0;
@@ -74,6 +84,16 @@ inline const char* ToString(const InputEventType type) {
             return "mouse_up";
         case InputEventType::Wheel:
             return "wheel";
+        case InputEventType::GamepadConnected:
+            return "gamepad_connected";
+        case InputEventType::GamepadDisconnected:
+            return "gamepad_disconnected";
+        case InputEventType::GamepadButtonDown:
+            return "gamepad_button_down";
+        case InputEventType::GamepadButtonUp:
+            return "gamepad_button_up";
+        case InputEventType::GamepadAxis:
+            return "gamepad_axis";
         case InputEventType::Stats:
             return "stats";
         default:

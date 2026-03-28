@@ -51,6 +51,7 @@ target_link_libraries(WinCaptureSync PRIVATE
     mf
     mfreadwrite
     mfuuid
+    xinput
     windowsapp
 )
 

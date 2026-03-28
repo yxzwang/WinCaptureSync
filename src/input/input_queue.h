@@ -22,14 +22,19 @@ public:
             return false;
         }
 
+        const auto is_low_priority_event = [](const InputEventType type) {
+            return type == InputEventType::MouseMove || type == InputEventType::GamepadAxis;
+        };
+
         if (queue_.size() >= max_size_) {
-            // Preserve critical inputs under pressure by sacrificing older move samples.
-            if (event.type != InputEventType::MouseMove) {
-                const auto move_it = std::find_if(queue_.begin(), queue_.end(), [](const InputEvent& e) {
-                    return e.type == InputEventType::MouseMove;
-                });
-                if (move_it != queue_.end()) {
-                    queue_.erase(move_it);
+            // Preserve critical inputs under pressure by sacrificing older continuous-signal samples.
+            if (!is_low_priority_event(event.type)) {
+                const auto evict_it =
+                    std::find_if(queue_.begin(), queue_.end(), [&](const InputEvent& queued) {
+                        return is_low_priority_event(queued.type);
+                    });
+                if (evict_it != queue_.end()) {
+                    queue_.erase(evict_it);
                 } else {
                     return false;
                 }

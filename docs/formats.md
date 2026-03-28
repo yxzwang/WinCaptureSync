@@ -96,6 +96,24 @@
 }
 ```
 
+### Gamepad Events
+
+The same `input.jsonl` stream also contains gamepad events (XInput).
+
+- `type=gamepad_connected | gamepad_disconnected`
+  - `gamepad_index`
+  - `packet`
+- `type=gamepad_button_down | gamepad_button_up`
+  - `gamepad_index`
+  - `packet`
+  - `control` (readable name, e.g. `a`, `b`, `left_shoulder`, `dpad_up`)
+- `type=gamepad_axis`
+  - `gamepad_index`
+  - `packet`
+  - `control` (`left_trigger`, `right_trigger`, `left_stick_x`, `left_stick_y`, `right_stick_x`, `right_stick_y`)
+  - `value`
+  - `prev_value`
+
 ## Dual Window Separate Outputs
 
 When dual-window recording is enabled, files are split by source:

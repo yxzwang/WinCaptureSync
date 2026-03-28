@@ -1,10 +1,13 @@
 #include "input/input_recorder.h"
 
+#include <Xinput.h>
 #include <Windowsx.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -14,6 +17,36 @@ namespace wcs::input {
 namespace {
 
 constexpr wchar_t kRawInputWindowClassName[] = L"WCS_INPUT_RAW_WINDOW";
+
+struct GamepadButtonMapEntry {
+    WORD mask = 0;
+    const char* name = "";
+};
+
+constexpr std::array<GamepadButtonMapEntry, 14> kGamepadButtons = {{
+    {XINPUT_GAMEPAD_DPAD_UP, "dpad_up"},
+    {XINPUT_GAMEPAD_DPAD_DOWN, "dpad_down"},
+    {XINPUT_GAMEPAD_DPAD_LEFT, "dpad_left"},
+    {XINPUT_GAMEPAD_DPAD_RIGHT, "dpad_right"},
+    {XINPUT_GAMEPAD_START, "start"},
+    {XINPUT_GAMEPAD_BACK, "back"},
+    {XINPUT_GAMEPAD_LEFT_THUMB, "left_thumb"},
+    {XINPUT_GAMEPAD_RIGHT_THUMB, "right_thumb"},
+    {XINPUT_GAMEPAD_LEFT_SHOULDER, "left_shoulder"},
+    {XINPUT_GAMEPAD_RIGHT_SHOULDER, "right_shoulder"},
+    {XINPUT_GAMEPAD_A, "a"},
+    {XINPUT_GAMEPAD_B, "b"},
+    {XINPUT_GAMEPAD_X, "x"},
+    {XINPUT_GAMEPAD_Y, "y"},
+}};
+
+int16_t ApplyStickDeadzone(const SHORT value, const SHORT deadzone) {
+    return static_cast<int16_t>((std::abs(static_cast<int>(value)) <= deadzone) ? 0 : value);
+}
+
+uint8_t ApplyTriggerDeadzone(const BYTE value) {
+    return static_cast<uint8_t>(value <= XINPUT_GAMEPAD_TRIGGER_THRESHOLD ? 0 : value);
+}
 
 std::string WideToUtf8(const std::wstring& wide) {
     if (wide.empty()) {
@@ -186,6 +219,10 @@ bool InputRecorder::Start(const std::filesystem::path& output_path,
         Stop();
         return false;
     }
+
+    if (options_.gamepad_enabled) {
+        gamepad_thread_ = std::thread(&InputRecorder::GamepadThreadMain, this);
+    }
     return true;
 }
 
@@ -201,6 +238,9 @@ void InputRecorder::Stop() {
 
     if (hook_thread_.joinable()) {
         hook_thread_.join();
+    }
+    if (gamepad_thread_.joinable()) {
+        gamepad_thread_.join();
     }
 
     EmitDiagSummary();
@@ -295,6 +335,163 @@ void InputRecorder::HookThreadMain() {
     }
 
     instance_ = nullptr;
+}
+
+void InputRecorder::GamepadThreadMain() {
+    struct GamepadState {
+        bool connected = false;
+        XINPUT_STATE state{};
+    };
+
+    std::array<GamepadState, XUSER_MAX_COUNT> gamepads{};
+    int poll_interval_ms = options_.gamepad_poll_interval_ms;
+    if (poll_interval_ms < 1) {
+        poll_interval_ms = 1;
+    }
+
+    auto emit_connection = [this](const int32_t index,
+                                  const InputEventType type,
+                                  const uint32_t packet) {
+        InputEvent event{};
+        event.t_qpc = wcs::time::QpcClock::NowTicks();
+        event.type = type;
+        event.mods = CurrentMods();
+        event.injected = false;
+        event.gamepad_index = index;
+        event.gamepad_packet = packet;
+        Enqueue(event);
+    };
+
+    auto emit_button = [this](const int32_t index,
+                              const uint32_t packet,
+                              const char* button_name,
+                              const bool pressed) {
+        InputEvent event{};
+        event.t_qpc = wcs::time::QpcClock::NowTicks();
+        event.type = pressed ? InputEventType::GamepadButtonDown : InputEventType::GamepadButtonUp;
+        event.mods = CurrentMods();
+        event.injected = false;
+        event.gamepad_index = index;
+        event.gamepad_packet = packet;
+        event.gamepad_control = button_name;
+        Enqueue(event);
+    };
+
+    auto emit_axis = [this](const int32_t index,
+                            const uint32_t packet,
+                            const char* axis_name,
+                            const int32_t value,
+                            const int32_t prev_value) {
+        InputEvent event{};
+        event.t_qpc = wcs::time::QpcClock::NowTicks();
+        event.type = InputEventType::GamepadAxis;
+        event.mods = CurrentMods();
+        event.injected = false;
+        event.gamepad_index = index;
+        event.gamepad_packet = packet;
+        event.gamepad_control = axis_name;
+        event.gamepad_value = value;
+        event.gamepad_prev_value = prev_value;
+        Enqueue(event);
+    };
+
+    auto emit_changes = [&](const int32_t index,
+                            const XINPUT_STATE& prev_state,
+                            const XINPUT_STATE& curr_state) {
+        const WORD prev_buttons = prev_state.Gamepad.wButtons;
+        const WORD curr_buttons = curr_state.Gamepad.wButtons;
+        const WORD changed = static_cast<WORD>(prev_buttons ^ curr_buttons);
+        for (const auto& button : kGamepadButtons) {
+            if ((changed & button.mask) == 0) {
+                continue;
+            }
+            const bool pressed = (curr_buttons & button.mask) != 0;
+            emit_button(index, curr_state.dwPacketNumber, button.name, pressed);
+        }
+
+        const int32_t prev_lt = ApplyTriggerDeadzone(prev_state.Gamepad.bLeftTrigger);
+        const int32_t curr_lt = ApplyTriggerDeadzone(curr_state.Gamepad.bLeftTrigger);
+        if (curr_lt != prev_lt) {
+            emit_axis(index, curr_state.dwPacketNumber, "left_trigger", curr_lt, prev_lt);
+        }
+
+        const int32_t prev_rt = ApplyTriggerDeadzone(prev_state.Gamepad.bRightTrigger);
+        const int32_t curr_rt = ApplyTriggerDeadzone(curr_state.Gamepad.bRightTrigger);
+        if (curr_rt != prev_rt) {
+            emit_axis(index, curr_state.dwPacketNumber, "right_trigger", curr_rt, prev_rt);
+        }
+
+        const int32_t prev_lx =
+            ApplyStickDeadzone(prev_state.Gamepad.sThumbLX, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+        const int32_t curr_lx =
+            ApplyStickDeadzone(curr_state.Gamepad.sThumbLX, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+        if (curr_lx != prev_lx) {
+            emit_axis(index, curr_state.dwPacketNumber, "left_stick_x", curr_lx, prev_lx);
+        }
+
+        const int32_t prev_ly =
+            ApplyStickDeadzone(prev_state.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+        const int32_t curr_ly =
+            ApplyStickDeadzone(curr_state.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+        if (curr_ly != prev_ly) {
+            emit_axis(index, curr_state.dwPacketNumber, "left_stick_y", curr_ly, prev_ly);
+        }
+
+        const int32_t prev_rx =
+            ApplyStickDeadzone(prev_state.Gamepad.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+        const int32_t curr_rx =
+            ApplyStickDeadzone(curr_state.Gamepad.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+        if (curr_rx != prev_rx) {
+            emit_axis(index, curr_state.dwPacketNumber, "right_stick_x", curr_rx, prev_rx);
+        }
+
+        const int32_t prev_ry =
+            ApplyStickDeadzone(prev_state.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+        const int32_t curr_ry =
+            ApplyStickDeadzone(curr_state.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+        if (curr_ry != prev_ry) {
+            emit_axis(index, curr_state.dwPacketNumber, "right_stick_y", curr_ry, prev_ry);
+        }
+    };
+
+    while (!stop_requested_.load()) {
+        for (DWORD idx = 0; idx < XUSER_MAX_COUNT; ++idx) {
+            XINPUT_STATE current_state{};
+            const DWORD status = XInputGetState(idx, &current_state);
+            auto& tracked = gamepads[idx];
+
+            if (status != ERROR_SUCCESS) {
+                if (tracked.connected) {
+                    emit_connection(static_cast<int32_t>(idx), InputEventType::GamepadDisconnected,
+                                    tracked.state.dwPacketNumber);
+                    tracked.connected = false;
+                    tracked.state = XINPUT_STATE{};
+                }
+                continue;
+            }
+
+            if (!tracked.connected) {
+                tracked.connected = true;
+                emit_connection(static_cast<int32_t>(idx), InputEventType::GamepadConnected,
+                                current_state.dwPacketNumber);
+
+                // Emit current held state immediately after connection.
+                const XINPUT_STATE zero_state{};
+                emit_changes(static_cast<int32_t>(idx), zero_state, current_state);
+                tracked.state = current_state;
+                continue;
+            }
+
+            if (current_state.dwPacketNumber == tracked.state.dwPacketNumber) {
+                continue;
+            }
+
+            emit_changes(static_cast<int32_t>(idx), tracked.state, current_state);
+            tracked.state = current_state;
+        }
+
+        Sleep(static_cast<DWORD>(poll_interval_ms));
+    }
 }
 
 void InputRecorder::WriterThreadMain() {

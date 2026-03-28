@@ -111,6 +111,24 @@ std::string InputWriter::Serialize(const InputEvent& event) const {
             oss << ",\"y\":" << event.y;
             oss << ",\"wheel_delta\":" << event.wheel_delta;
             break;
+        case InputEventType::GamepadConnected:
+        case InputEventType::GamepadDisconnected:
+            oss << ",\"gamepad_index\":" << event.gamepad_index;
+            oss << ",\"packet\":" << event.gamepad_packet;
+            break;
+        case InputEventType::GamepadButtonDown:
+        case InputEventType::GamepadButtonUp:
+            oss << ",\"gamepad_index\":" << event.gamepad_index;
+            oss << ",\"packet\":" << event.gamepad_packet;
+            oss << ",\"control\":" << json::Quote(event.gamepad_control);
+            break;
+        case InputEventType::GamepadAxis:
+            oss << ",\"gamepad_index\":" << event.gamepad_index;
+            oss << ",\"packet\":" << event.gamepad_packet;
+            oss << ",\"control\":" << json::Quote(event.gamepad_control);
+            oss << ",\"value\":" << event.gamepad_value;
+            oss << ",\"prev_value\":" << event.gamepad_prev_value;
+            break;
         case InputEventType::Stats:
             oss << ",\"dropped_events\":" << event.dropped_events;
             break;

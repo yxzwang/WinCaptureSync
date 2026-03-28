@@ -106,6 +106,7 @@ foreach ($line in $lines) {
 
         $keyName = if ($objHash.Contains("key_name")) { [string]$objHash["key_name"] } else { "" }
         $button = if ($objHash.Contains("button")) { [string]$objHash["button"] } else { "" }
+        $control = if ($objHash.Contains("control")) { [string]$objHash["control"] } else { "" }
         $csvRows.Add([pscustomobject]@{
             type = [string]$objHash["type"]
             t_qpc = [int64]$tQpc
@@ -113,6 +114,7 @@ foreach ($line in $lines) {
             t_input_ms = [Math]::Round($tInputMs, 3)
             key_name = $keyName
             button = $button
+            control = $control
             wheel_delta = if ($objHash.Contains("wheel_delta")) { $objHash["wheel_delta"] } else { $null }
         }) | Out-Null
     } elseif ([string]$objHash["type"] -eq "session_header") {

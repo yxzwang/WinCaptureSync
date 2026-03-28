@@ -23,6 +23,8 @@ public:
         size_t batch_size = 512;
         int flush_interval_ms = 10;
         bool diagnostic_mode = false;
+        bool gamepad_enabled = true;
+        int gamepad_poll_interval_ms = 2;
     };
 
     InputRecorder() = default;
@@ -39,6 +41,7 @@ public:
 
 private:
     void HookThreadMain();
+    void GamepadThreadMain();
     void WriterThreadMain();
     void EmitSessionHeader();
     void Enqueue(const InputEvent& event);
@@ -64,6 +67,7 @@ private:
     std::unique_ptr<InputEventQueue> queue_{};
 
     std::thread hook_thread_{};
+    std::thread gamepad_thread_{};
     std::thread writer_thread_{};
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};

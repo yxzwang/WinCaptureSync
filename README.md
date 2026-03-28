@@ -14,7 +14,7 @@ Low-latency synchronized screen recording + Keyboard/Mouse input logging (Window
 - **Global Hotkey:** One-key start/stop (Default: `Ctrl+Alt+F9`, configurable).
 - **GUI Interface:** Source selection, window list, real-time preview, and manual controls.
 - **Video Output:** `video.mp4` (H.264, via Windows Media Foundation).
-- **Input Logging:** `input.jsonl` (utilizing `WH_KEYBOARD_LL` + `WH_MOUSE_LL`).
+- **Input Logging:** `input.jsonl` for keyboard, mouse, and gamepad input.
 - **Metadata:** `video_meta.json` for session details.
 - **Unified Timebase:** QPC (Query Performance Counter) mapped to UTC anchors for high-precision sync.
 - **State Machine:** Robust flow: `Idle -> Arming -> Recording -> Stopping -> Idle`.
@@ -175,6 +175,46 @@ input_diagnostic_mode=1
 ```
 
 When enabled, an additional file `input_diag.jsonl` is created per session, containing raw registration info and per-message diagnostic data. This is useful for debugging cases where specific games fail to send expected mouse events.
+
+## Gamepad Input Recording
+
+Gamepad input is recorded through `XInput` and written into the same `input.jsonl`.
+
+- Supports up to 4 controllers (`gamepad_index` 0-3).
+- Records connection lifecycle:
+  - `gamepad_connected`
+  - `gamepad_disconnected`
+- Records button events with readable control names:
+  - `gamepad_button_down`
+  - `gamepad_button_up`
+- Records analog changes:
+  - `gamepad_axis` for `left_trigger`, `right_trigger`, `left_stick_x`, `left_stick_y`, `right_stick_x`, `right_stick_y`
+
+### Stick Axis Event Format
+
+Left and right sticks are recorded as `gamepad_axis` events:
+
+- Left stick: `left_stick_x`, `left_stick_y`
+- Right stick: `right_stick_x`, `right_stick_y`
+
+Fields:
+
+- `type`: `gamepad_axis`
+- `gamepad_index`: controller index (`0-3`)
+- `packet`: XInput packet number
+- `control`: axis name
+- `value`: current axis value (`-32768` to `32767`, deadzone is normalized to `0`)
+- `prev_value`: previous axis value
+- `t_qpc`: event timestamp in QPC ticks
+
+Example:
+
+```json
+{"type":"gamepad_axis","t_qpc":1234567890,"mods":{"shift":false,"ctrl":false,"alt":false,"win":false},"injected":false,"gamepad_index":0,"packet":2048,"control":"left_stick_x","value":13420,"prev_value":0}
+{"type":"gamepad_axis","t_qpc":1234567902,"mods":{"shift":false,"ctrl":false,"alt":false,"win":false},"injected":false,"gamepad_index":0,"packet":2048,"control":"left_stick_y","value":-8421,"prev_value":-120}
+{"type":"gamepad_axis","t_qpc":1234567920,"mods":{"shift":false,"ctrl":false,"alt":false,"win":false},"injected":false,"gamepad_index":0,"packet":2049,"control":"right_stick_x","value":22100,"prev_value":21980}
+{"type":"gamepad_axis","t_qpc":1234567935,"mods":{"shift":false,"ctrl":false,"alt":false,"win":false},"injected":false,"gamepad_index":0,"packet":2049,"control":"right_stick_y","value":-30000,"prev_value":-29700}
+```
 
 ## Capture Backends
 
