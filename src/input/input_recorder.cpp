@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "common/logger.h"
+
 namespace wcs::input {
 
 namespace {
@@ -169,6 +171,7 @@ bool InputRecorder::Start(const std::filesystem::path& output_path,
     if (running_.load()) {
         return false;
     }
+    wcs::common::log::Info("InputRecorder Start: " + output_path.string());
 
     anchor_ = utc_anchor;
     options_ = options;
@@ -195,6 +198,7 @@ bool InputRecorder::Start(const std::filesystem::path& output_path,
 
     queue_ = std::make_unique<InputEventQueue>(options_.queue_capacity);
     if (!writer_.Open(output_path)) {
+        wcs::common::log::Error("InputRecorder failed to open output file: " + output_path.string());
         queue_.reset();
         return false;
     }
@@ -202,6 +206,8 @@ bool InputRecorder::Start(const std::filesystem::path& output_path,
         const std::filesystem::path diag_path = output_path.parent_path() / "input_diag.jsonl";
         diag_file_.open(diag_path, std::ios::binary | std::ios::out | std::ios::trunc);
         if (!diag_file_.is_open()) {
+            wcs::common::log::Warning("InputRecorder cannot open diagnostic file: " +
+                                      diag_path.string());
             diagnostic_mode_ = false;
         }
     }
@@ -211,11 +217,16 @@ bool InputRecorder::Start(const std::filesystem::path& output_path,
     hook_thread_ = std::thread(&InputRecorder::HookThreadMain, this);
 
     std::unique_lock<std::mutex> lock(ready_mutex_);
-    ready_cv_.wait(lock, [this] { return ready_signaled_; });
+    const bool signaled = ready_cv_.wait_for(lock, std::chrono::seconds(5),
+                                             [this] { return ready_signaled_; });
+    if (!signaled) {
+        wcs::common::log::Error("InputRecorder start timeout waiting hook thread ready");
+    }
     const bool ready = hooks_installed_;
     lock.unlock();
 
-    if (!ready) {
+    if (!ready || !signaled) {
+        wcs::common::log::Error("InputRecorder hook initialization failed");
         Stop();
         return false;
     }
@@ -223,6 +234,7 @@ bool InputRecorder::Start(const std::filesystem::path& output_path,
     if (options_.gamepad_enabled) {
         gamepad_thread_ = std::thread(&InputRecorder::GamepadThreadMain, this);
     }
+    wcs::common::log::Info("InputRecorder started");
     return true;
 }
 
@@ -230,6 +242,7 @@ void InputRecorder::Stop() {
     if (!running_.load()) {
         return;
     }
+    wcs::common::log::Info("InputRecorder stopping");
 
     stop_requested_.store(true);
     if (hook_thread_id_ != 0) {
@@ -268,32 +281,67 @@ void InputRecorder::Stop() {
     queue_.reset();
     running_.store(false);
     hook_thread_id_ = 0;
+    wcs::common::log::Info("InputRecorder stopped");
 }
 
 void InputRecorder::HookThreadMain() {
-    hook_thread_id_ = GetCurrentThreadId();
-    instance_ = this;
+    try {
+        hook_thread_id_ = GetCurrentThreadId();
+        instance_ = this;
 
-    MSG init_msg{};
-    PeekMessageW(&init_msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+        MSG init_msg{};
+        PeekMessageW(&init_msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
-    const bool raw_window_ok = CreateRawInputWindow();
-    raw_input_active_ = raw_window_ok && RegisterRawInputSink();
-    // Raw-input-only mode: do not install low-level hooks.
-    hooks_installed_ = raw_input_active_;
-    if (diagnostic_mode_) {
-        std::ostringstream oss;
-        oss << "{\"type\":\"diag_info\",\"t_qpc\":" << wcs::time::QpcClock::NowTicks()
-            << ",\"raw_window_ok\":" << (raw_window_ok ? "true" : "false")
-            << ",\"raw_input_active\":" << (raw_input_active_ ? "true" : "false")
-            << ",\"raw_register_flags\":\"RIDEV_INPUTSINK\""
-            << ",\"mode\":\"raw_input_only\"}";
-        WriteDiagLine(oss.str());
-    }
+        const bool raw_window_ok = CreateRawInputWindow();
+        raw_input_active_ = raw_window_ok && RegisterRawInputSink();
+        // Raw-input-only mode: do not install low-level hooks.
+        hooks_installed_ = raw_input_active_;
+        if (diagnostic_mode_) {
+            std::ostringstream oss;
+            oss << "{\"type\":\"diag_info\",\"t_qpc\":" << wcs::time::QpcClock::NowTicks()
+                << ",\"raw_window_ok\":" << (raw_window_ok ? "true" : "false")
+                << ",\"raw_input_active\":" << (raw_input_active_ ? "true" : "false")
+                << ",\"raw_register_flags\":\"RIDEV_INPUTSINK\""
+                << ",\"mode\":\"raw_input_only\"}";
+            WriteDiagLine(oss.str());
+        }
+        wcs::common::log::Info(std::string("Input hook thread raw_input_active=") +
+                               (raw_input_active_ ? "true" : "false"));
 
-    if (hooks_installed_) {
-        start_qpc_.store(wcs::time::QpcClock::NowTicks());
-        EmitSessionHeader();
+        if (hooks_installed_) {
+            start_qpc_.store(wcs::time::QpcClock::NowTicks());
+            EmitSessionHeader();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(ready_mutex_);
+            ready_signaled_ = true;
+        }
+        ready_cv_.notify_one();
+
+        if (hooks_installed_) {
+            MSG msg{};
+            while (!stop_requested_.load()) {
+                const BOOL result = GetMessageW(&msg, nullptr, 0, 0);
+                if (result <= 0) {
+                    break;
+                }
+
+                if (msg.message == WM_INPUT) {
+                    HandleRawInput(reinterpret_cast<HRAWINPUT>(msg.lParam), msg.wParam);
+                    DefWindowProcW(msg.hwnd, msg.message, msg.wParam, msg.lParam);
+                    continue;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    } catch (const std::exception& ex) {
+        wcs::common::log::Error(std::string("Input hook thread exception: ") + ex.what());
+        stop_requested_.store(true);
+    } catch (...) {
+        wcs::common::log::Error("Input hook thread unknown exception");
+        stop_requested_.store(true);
     }
 
     {
@@ -301,24 +349,6 @@ void InputRecorder::HookThreadMain() {
         ready_signaled_ = true;
     }
     ready_cv_.notify_one();
-
-    if (hooks_installed_) {
-        MSG msg{};
-        while (!stop_requested_.load()) {
-            const BOOL result = GetMessageW(&msg, nullptr, 0, 0);
-            if (result <= 0) {
-                break;
-            }
-
-            if (msg.message == WM_INPUT) {
-                HandleRawInput(reinterpret_cast<HRAWINPUT>(msg.lParam), msg.wParam);
-                DefWindowProcW(msg.hwnd, msg.message, msg.wParam, msg.lParam);
-                continue;
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
 
     if (raw_input_hwnd_ != nullptr) {
         DestroyWindow(raw_input_hwnd_);
@@ -338,182 +368,202 @@ void InputRecorder::HookThreadMain() {
 }
 
 void InputRecorder::GamepadThreadMain() {
-    struct GamepadState {
-        bool connected = false;
-        XINPUT_STATE state{};
-    };
+    try {
+        struct GamepadState {
+            bool connected = false;
+            XINPUT_STATE state{};
+        };
 
-    std::array<GamepadState, XUSER_MAX_COUNT> gamepads{};
-    int poll_interval_ms = options_.gamepad_poll_interval_ms;
-    if (poll_interval_ms < 1) {
-        poll_interval_ms = 1;
-    }
-
-    auto emit_connection = [this](const int32_t index,
-                                  const InputEventType type,
-                                  const uint32_t packet) {
-        InputEvent event{};
-        event.t_qpc = wcs::time::QpcClock::NowTicks();
-        event.type = type;
-        event.mods = CurrentMods();
-        event.injected = false;
-        event.gamepad_index = index;
-        event.gamepad_packet = packet;
-        Enqueue(event);
-    };
-
-    auto emit_button = [this](const int32_t index,
-                              const uint32_t packet,
-                              const char* button_name,
-                              const bool pressed) {
-        InputEvent event{};
-        event.t_qpc = wcs::time::QpcClock::NowTicks();
-        event.type = pressed ? InputEventType::GamepadButtonDown : InputEventType::GamepadButtonUp;
-        event.mods = CurrentMods();
-        event.injected = false;
-        event.gamepad_index = index;
-        event.gamepad_packet = packet;
-        event.gamepad_control = button_name;
-        Enqueue(event);
-    };
-
-    auto emit_axis = [this](const int32_t index,
-                            const uint32_t packet,
-                            const char* axis_name,
-                            const int32_t value,
-                            const int32_t prev_value) {
-        InputEvent event{};
-        event.t_qpc = wcs::time::QpcClock::NowTicks();
-        event.type = InputEventType::GamepadAxis;
-        event.mods = CurrentMods();
-        event.injected = false;
-        event.gamepad_index = index;
-        event.gamepad_packet = packet;
-        event.gamepad_control = axis_name;
-        event.gamepad_value = value;
-        event.gamepad_prev_value = prev_value;
-        Enqueue(event);
-    };
-
-    auto emit_changes = [&](const int32_t index,
-                            const XINPUT_STATE& prev_state,
-                            const XINPUT_STATE& curr_state) {
-        const WORD prev_buttons = prev_state.Gamepad.wButtons;
-        const WORD curr_buttons = curr_state.Gamepad.wButtons;
-        const WORD changed = static_cast<WORD>(prev_buttons ^ curr_buttons);
-        for (const auto& button : kGamepadButtons) {
-            if ((changed & button.mask) == 0) {
-                continue;
-            }
-            const bool pressed = (curr_buttons & button.mask) != 0;
-            emit_button(index, curr_state.dwPacketNumber, button.name, pressed);
+        std::array<GamepadState, XUSER_MAX_COUNT> gamepads{};
+        int poll_interval_ms = options_.gamepad_poll_interval_ms;
+        if (poll_interval_ms < 1) {
+            poll_interval_ms = 1;
         }
+        wcs::common::log::Info("Gamepad thread started, poll_interval_ms=" +
+                               std::to_string(poll_interval_ms));
 
-        const int32_t prev_lt = ApplyTriggerDeadzone(prev_state.Gamepad.bLeftTrigger);
-        const int32_t curr_lt = ApplyTriggerDeadzone(curr_state.Gamepad.bLeftTrigger);
-        if (curr_lt != prev_lt) {
-            emit_axis(index, curr_state.dwPacketNumber, "left_trigger", curr_lt, prev_lt);
-        }
+        auto emit_connection = [this](const int32_t index,
+                                      const InputEventType type,
+                                      const uint32_t packet) {
+            InputEvent event{};
+            event.t_qpc = wcs::time::QpcClock::NowTicks();
+            event.type = type;
+            event.mods = CurrentMods();
+            event.injected = false;
+            event.gamepad_index = index;
+            event.gamepad_packet = packet;
+            Enqueue(event);
+        };
 
-        const int32_t prev_rt = ApplyTriggerDeadzone(prev_state.Gamepad.bRightTrigger);
-        const int32_t curr_rt = ApplyTriggerDeadzone(curr_state.Gamepad.bRightTrigger);
-        if (curr_rt != prev_rt) {
-            emit_axis(index, curr_state.dwPacketNumber, "right_trigger", curr_rt, prev_rt);
-        }
+        auto emit_button = [this](const int32_t index,
+                                  const uint32_t packet,
+                                  const char* button_name,
+                                  const bool pressed) {
+            InputEvent event{};
+            event.t_qpc = wcs::time::QpcClock::NowTicks();
+            event.type = pressed ? InputEventType::GamepadButtonDown : InputEventType::GamepadButtonUp;
+            event.mods = CurrentMods();
+            event.injected = false;
+            event.gamepad_index = index;
+            event.gamepad_packet = packet;
+            event.gamepad_control = button_name;
+            Enqueue(event);
+        };
 
-        const int32_t prev_lx =
-            ApplyStickDeadzone(prev_state.Gamepad.sThumbLX, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
-        const int32_t curr_lx =
-            ApplyStickDeadzone(curr_state.Gamepad.sThumbLX, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
-        if (curr_lx != prev_lx) {
-            emit_axis(index, curr_state.dwPacketNumber, "left_stick_x", curr_lx, prev_lx);
-        }
+        auto emit_axis = [this](const int32_t index,
+                                const uint32_t packet,
+                                const char* axis_name,
+                                const int32_t value,
+                                const int32_t prev_value) {
+            InputEvent event{};
+            event.t_qpc = wcs::time::QpcClock::NowTicks();
+            event.type = InputEventType::GamepadAxis;
+            event.mods = CurrentMods();
+            event.injected = false;
+            event.gamepad_index = index;
+            event.gamepad_packet = packet;
+            event.gamepad_control = axis_name;
+            event.gamepad_value = value;
+            event.gamepad_prev_value = prev_value;
+            Enqueue(event);
+        };
 
-        const int32_t prev_ly =
-            ApplyStickDeadzone(prev_state.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
-        const int32_t curr_ly =
-            ApplyStickDeadzone(curr_state.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
-        if (curr_ly != prev_ly) {
-            emit_axis(index, curr_state.dwPacketNumber, "left_stick_y", curr_ly, prev_ly);
-        }
-
-        const int32_t prev_rx =
-            ApplyStickDeadzone(prev_state.Gamepad.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
-        const int32_t curr_rx =
-            ApplyStickDeadzone(curr_state.Gamepad.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
-        if (curr_rx != prev_rx) {
-            emit_axis(index, curr_state.dwPacketNumber, "right_stick_x", curr_rx, prev_rx);
-        }
-
-        const int32_t prev_ry =
-            ApplyStickDeadzone(prev_state.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
-        const int32_t curr_ry =
-            ApplyStickDeadzone(curr_state.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
-        if (curr_ry != prev_ry) {
-            emit_axis(index, curr_state.dwPacketNumber, "right_stick_y", curr_ry, prev_ry);
-        }
-    };
-
-    while (!stop_requested_.load()) {
-        for (DWORD idx = 0; idx < XUSER_MAX_COUNT; ++idx) {
-            XINPUT_STATE current_state{};
-            const DWORD status = XInputGetState(idx, &current_state);
-            auto& tracked = gamepads[idx];
-
-            if (status != ERROR_SUCCESS) {
-                if (tracked.connected) {
-                    emit_connection(static_cast<int32_t>(idx), InputEventType::GamepadDisconnected,
-                                    tracked.state.dwPacketNumber);
-                    tracked.connected = false;
-                    tracked.state = XINPUT_STATE{};
+        auto emit_changes = [&](const int32_t index,
+                                const XINPUT_STATE& prev_state,
+                                const XINPUT_STATE& curr_state) {
+            const WORD prev_buttons = prev_state.Gamepad.wButtons;
+            const WORD curr_buttons = curr_state.Gamepad.wButtons;
+            const WORD changed = static_cast<WORD>(prev_buttons ^ curr_buttons);
+            for (const auto& button : kGamepadButtons) {
+                if ((changed & button.mask) == 0) {
+                    continue;
                 }
-                continue;
+                const bool pressed = (curr_buttons & button.mask) != 0;
+                emit_button(index, curr_state.dwPacketNumber, button.name, pressed);
             }
 
-            if (!tracked.connected) {
-                tracked.connected = true;
-                emit_connection(static_cast<int32_t>(idx), InputEventType::GamepadConnected,
-                                current_state.dwPacketNumber);
+            const int32_t prev_lt = ApplyTriggerDeadzone(prev_state.Gamepad.bLeftTrigger);
+            const int32_t curr_lt = ApplyTriggerDeadzone(curr_state.Gamepad.bLeftTrigger);
+            if (curr_lt != prev_lt) {
+                emit_axis(index, curr_state.dwPacketNumber, "left_trigger", curr_lt, prev_lt);
+            }
 
-                // Emit current held state immediately after connection.
-                const XINPUT_STATE zero_state{};
-                emit_changes(static_cast<int32_t>(idx), zero_state, current_state);
+            const int32_t prev_rt = ApplyTriggerDeadzone(prev_state.Gamepad.bRightTrigger);
+            const int32_t curr_rt = ApplyTriggerDeadzone(curr_state.Gamepad.bRightTrigger);
+            if (curr_rt != prev_rt) {
+                emit_axis(index, curr_state.dwPacketNumber, "right_trigger", curr_rt, prev_rt);
+            }
+
+            const int32_t prev_lx =
+                ApplyStickDeadzone(prev_state.Gamepad.sThumbLX, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+            const int32_t curr_lx =
+                ApplyStickDeadzone(curr_state.Gamepad.sThumbLX, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+            if (curr_lx != prev_lx) {
+                emit_axis(index, curr_state.dwPacketNumber, "left_stick_x", curr_lx, prev_lx);
+            }
+
+            const int32_t prev_ly =
+                ApplyStickDeadzone(prev_state.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+            const int32_t curr_ly =
+                ApplyStickDeadzone(curr_state.Gamepad.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+            if (curr_ly != prev_ly) {
+                emit_axis(index, curr_state.dwPacketNumber, "left_stick_y", curr_ly, prev_ly);
+            }
+
+            const int32_t prev_rx =
+                ApplyStickDeadzone(prev_state.Gamepad.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+            const int32_t curr_rx =
+                ApplyStickDeadzone(curr_state.Gamepad.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+            if (curr_rx != prev_rx) {
+                emit_axis(index, curr_state.dwPacketNumber, "right_stick_x", curr_rx, prev_rx);
+            }
+
+            const int32_t prev_ry =
+                ApplyStickDeadzone(prev_state.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+            const int32_t curr_ry =
+                ApplyStickDeadzone(curr_state.Gamepad.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+            if (curr_ry != prev_ry) {
+                emit_axis(index, curr_state.dwPacketNumber, "right_stick_y", curr_ry, prev_ry);
+            }
+        };
+
+        while (!stop_requested_.load()) {
+            for (DWORD idx = 0; idx < XUSER_MAX_COUNT; ++idx) {
+                XINPUT_STATE current_state{};
+                const DWORD status = XInputGetState(idx, &current_state);
+                auto& tracked = gamepads[idx];
+
+                if (status != ERROR_SUCCESS) {
+                    if (tracked.connected) {
+                        emit_connection(static_cast<int32_t>(idx),
+                                        InputEventType::GamepadDisconnected,
+                                        tracked.state.dwPacketNumber);
+                        tracked.connected = false;
+                        tracked.state = XINPUT_STATE{};
+                    }
+                    continue;
+                }
+
+                if (!tracked.connected) {
+                    tracked.connected = true;
+                    emit_connection(static_cast<int32_t>(idx), InputEventType::GamepadConnected,
+                                    current_state.dwPacketNumber);
+
+                    // Emit current held state immediately after connection.
+                    const XINPUT_STATE zero_state{};
+                    emit_changes(static_cast<int32_t>(idx), zero_state, current_state);
+                    tracked.state = current_state;
+                    continue;
+                }
+
+                if (current_state.dwPacketNumber == tracked.state.dwPacketNumber) {
+                    continue;
+                }
+
+                emit_changes(static_cast<int32_t>(idx), tracked.state, current_state);
                 tracked.state = current_state;
-                continue;
             }
 
-            if (current_state.dwPacketNumber == tracked.state.dwPacketNumber) {
-                continue;
-            }
-
-            emit_changes(static_cast<int32_t>(idx), tracked.state, current_state);
-            tracked.state = current_state;
+            Sleep(static_cast<DWORD>(poll_interval_ms));
         }
-
-        Sleep(static_cast<DWORD>(poll_interval_ms));
+        wcs::common::log::Info("Gamepad thread exited");
+    } catch (const std::exception& ex) {
+        wcs::common::log::Error(std::string("Gamepad thread exception: ") + ex.what());
+        stop_requested_.store(true);
+    } catch (...) {
+        wcs::common::log::Error("Gamepad thread unknown exception");
+        stop_requested_.store(true);
     }
 }
 
 void InputRecorder::WriterThreadMain() {
-    std::vector<InputEvent> batch;
-    while (true) {
-        batch.clear();
-        if (queue_) {
-            queue_->PopBatch(&batch, options_.batch_size,
-                             std::chrono::milliseconds(options_.flush_interval_ms));
-        }
+    try {
+        std::vector<InputEvent> batch;
+        while (true) {
+            batch.clear();
+            if (queue_) {
+                queue_->PopBatch(&batch, options_.batch_size,
+                                 std::chrono::milliseconds(options_.flush_interval_ms));
+            }
 
-        if (!batch.empty()) {
-            writer_.WriteBatch(batch);
-        }
+            if (!batch.empty()) {
+                writer_.WriteBatch(batch);
+            }
 
-        if (!batch.empty() || stop_requested_.load()) {
-            writer_.Flush();
-        }
+            if (!batch.empty() || stop_requested_.load()) {
+                writer_.Flush();
+            }
 
-        if (stop_requested_.load() && (!queue_ || queue_->Empty())) {
-            break;
+            if (stop_requested_.load() && (!queue_ || queue_->Empty())) {
+                break;
+            }
         }
+    } catch (const std::exception& ex) {
+        wcs::common::log::Error(std::string("Input writer thread exception: ") + ex.what());
+        stop_requested_.store(true);
+    } catch (...) {
+        wcs::common::log::Error("Input writer thread unknown exception");
+        stop_requested_.store(true);
     }
 }
 
@@ -600,6 +650,8 @@ bool InputRecorder::CreateRawInputWindow() {
     if (!RegisterClassW(&wc)) {
         const DWORD err = GetLastError();
         if (err != ERROR_CLASS_ALREADY_EXISTS) {
+            wcs::common::log::Error("RegisterClassW for raw input window failed, error=" +
+                                    std::to_string(err));
             return false;
         }
     }
@@ -608,6 +660,9 @@ bool InputRecorder::CreateRawInputWindow() {
                                       WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
     if (raw_input_hwnd_ != nullptr) {
         ShowWindow(raw_input_hwnd_, SW_HIDE);
+    } else {
+        wcs::common::log::Error("CreateWindowExW for raw input window failed, error=" +
+                                std::to_string(GetLastError()));
     }
     return raw_input_hwnd_ != nullptr;
 }
@@ -632,7 +687,12 @@ bool InputRecorder::RegisterRawInputSink() const {
     devices[1].usUsage = 0x06;      // Keyboard
     devices[1].dwFlags = flags;
     devices[1].hwndTarget = raw_input_hwnd_;
-    return RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE)) == TRUE;
+    const bool ok = RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE)) == TRUE;
+    if (!ok) {
+        wcs::common::log::Error("RegisterRawInputDevices failed, error=" +
+                                std::to_string(GetLastError()));
+    }
+    return ok;
 }
 
 void InputRecorder::HandleRawInput(const HRAWINPUT raw_input_handle, const WPARAM raw_input_w_param) {

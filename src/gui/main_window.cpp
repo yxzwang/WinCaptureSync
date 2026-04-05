@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <iomanip>
 #include <iterator>
 #include <sstream>
 #include <string>
+
+#include "common/logger.h"
 
 namespace wcs::gui {
 
@@ -354,51 +357,59 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, const UINT msg, const WPARAM w_p
 }
 
 LRESULT MainWindow::HandleMessage(const UINT msg, const WPARAM w_param, const LPARAM l_param) {
-    switch (msg) {
-        case WM_CREATE:
-            OnCreate();
-            return 0;
-        case WM_DESTROY:
-            OnDestroy();
-            return 0;
-        case WM_SIZE:
-            OnSize(LOWORD(l_param), HIWORD(l_param));
-            return 0;
-        case WM_COMMAND:
-            OnCommand(w_param, l_param);
-            return 0;
-        case WM_TIMER:
-            if (w_param == kPreviewTimerId) {
-                OnTimer();
+    try {
+        switch (msg) {
+            case WM_CREATE:
+                OnCreate();
                 return 0;
-            }
-            break;
-        case WM_PAINT:
-            OnPaint();
-            return 0;
-        case WM_ERASEBKGND:
-            // Paint is fully handled in WM_PAINT to reduce flicker.
-            return 1;
-        case WM_HOTKEY:
-            if (controller_.IsOurHotkey(w_param)) {
-                if (controller_.State() == wcs::mainapp::RecorderState::Idle) {
-                    const auto sources = CurrentSourcesFromUi();
-                    if (sources.empty()) {
-                        UpdateStatus(L"Please select at least one source");
-                        return 0;
-                    }
-                    ApplyUiOptionsToController();
+            case WM_DESTROY:
+                OnDestroy();
+                return 0;
+            case WM_SIZE:
+                OnSize(LOWORD(l_param), HIWORD(l_param));
+                return 0;
+            case WM_COMMAND:
+                OnCommand(w_param, l_param);
+                return 0;
+            case WM_TIMER:
+                if (w_param == kPreviewTimerId) {
+                    OnTimer();
+                    return 0;
                 }
-                const auto prev_state = controller_.State();
-                controller_.ToggleRecording();
-                SyncRecordingDuration(prev_state, controller_.State());
-                UpdateControlState();
-                UpdateStatus(controller_.StatusText());
-                UpdatePreviewPipeline();
-            }
-            return 0;
-        default:
-            break;
+                break;
+            case WM_PAINT:
+                OnPaint();
+                return 0;
+            case WM_ERASEBKGND:
+                // Paint is fully handled in WM_PAINT to reduce flicker.
+                return 1;
+            case WM_HOTKEY:
+                if (controller_.IsOurHotkey(w_param)) {
+                    if (controller_.State() == wcs::mainapp::RecorderState::Idle) {
+                        const auto sources = CurrentSourcesFromUi();
+                        if (sources.empty()) {
+                            UpdateStatus(L"Please select at least one source");
+                            return 0;
+                        }
+                        ApplyUiOptionsToController();
+                    }
+                    const auto prev_state = controller_.State();
+                    controller_.ToggleRecording();
+                    SyncRecordingDuration(prev_state, controller_.State());
+                    UpdateControlState();
+                    UpdateStatus(controller_.StatusText());
+                    UpdatePreviewPipeline();
+                }
+                return 0;
+            default:
+                break;
+        }
+    } catch (const std::exception& ex) {
+        wcs::common::log::Error(std::string("MainWindow::HandleMessage exception: ") + ex.what());
+        UpdateStatus(L"Internal error, see logs");
+    } catch (...) {
+        wcs::common::log::Error("MainWindow::HandleMessage unknown exception");
+        UpdateStatus(L"Internal error, see logs");
     }
     return DefWindowProcW(hwnd_, msg, w_param, l_param);
 }
@@ -490,10 +501,10 @@ void MainWindow::OnCreate() {
                         nullptr);
 
     recording_duration_label_ =
-        CreateWindowExW(0, L"STATIC", L"Rec Time", WS_CHILD | WS_VISIBLE, 480, 72, 70, 24, hwnd_,
-                        nullptr, instance_, nullptr);
+        CreateWindowExW(0, L"STATIC", L"Rec", WS_CHILD | WS_VISIBLE, 480, 72, 34, 24, hwnd_, nullptr,
+                        instance_, nullptr);
     recording_duration_value_ =
-        CreateWindowExW(0, L"STATIC", L"00:00:00", WS_CHILD | WS_VISIBLE, 552, 72, 120, 24, hwnd_,
+        CreateWindowExW(0, L"STATIC", L"00:00:00", WS_CHILD | WS_VISIBLE, 538, 72, 120, 24, hwnd_,
                         nullptr, instance_, nullptr);
 
     hotkey_label_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 12, 100, 460, 24, hwnd_,
@@ -557,8 +568,21 @@ void MainWindow::OnSize(const int width, const int height) {
     const int right_x = width - margin;
     MoveWindow(refresh_button_, right_x - 104 - 96, 44, 96, 24, TRUE);
     MoveWindow(start_stop_button_, right_x - 104, 44, 104, 24, TRUE);
-    MoveWindow(recording_duration_label_, width / 2, 72, 70, 24, TRUE);
-    MoveWindow(recording_duration_value_, width / 2 + 72, 72, 120, 24, TRUE);
+    const int recording_row_x = width / 2;
+    constexpr int rec_label_width = 34;
+    constexpr int indicator_size = 10;
+    constexpr int gap_after_label = 6;
+    constexpr int gap_before_time = 8;
+    MoveWindow(recording_duration_label_, recording_row_x, 72, rec_label_width, 24, TRUE);
+    const int indicator_left = recording_row_x + rec_label_width + gap_after_label;
+    MoveWindow(recording_duration_value_, indicator_left + indicator_size + gap_before_time, 72, 120,
+               24, TRUE);
+    const int indicator_center_x = indicator_left + (indicator_size / 2);
+    const int indicator_center_y = 72 + 12;
+    recording_indicator_rect_.left = indicator_center_x - (indicator_size / 2);
+    recording_indicator_rect_.top = indicator_center_y - (indicator_size / 2);
+    recording_indicator_rect_.right = recording_indicator_rect_.left + indicator_size;
+    recording_indicator_rect_.bottom = recording_indicator_rect_.top + indicator_size;
     MoveWindow(hotkey_label_, margin, 100, (std::max)(200, width / 2 - margin), 24, TRUE);
     MoveWindow(status_label_, width / 2, 100, (std::max)(180, width / 2 - margin), 24, TRUE);
 
@@ -577,6 +601,7 @@ void MainWindow::OnSize(const int width, const int height) {
     const int preview_h = preview_rect_.bottom - preview_rect_.top;
     EnsurePreviewBuffer(preview_w, preview_h);
     UpdateDwmThumbnail();
+    InvalidateRect(hwnd_, &recording_indicator_rect_, FALSE);
 }
 
 void MainWindow::OnPaint() {
@@ -605,6 +630,39 @@ void MainWindow::OnPaint() {
     HBRUSH frame_brush = CreateSolidBrush(RGB(40, 44, 52));
     FrameRect(paint_dc, &border, frame_brush);
     DeleteObject(frame_brush);
+
+    const auto state = controller_.State();
+    const bool is_recording = (state == wcs::mainapp::RecorderState::Recording ||
+                               state == wcs::mainapp::RecorderState::Stopping);
+    const COLORREF glow_outer_color = is_recording ? RGB(112, 235, 150) : RGB(255, 210, 205);
+    const COLORREF glow_mid_color = is_recording ? RGB(78, 220, 130) : RGB(255, 145, 134);
+    const COLORREF core_color = is_recording ? RGB(46, 204, 113) : RGB(231, 76, 60);
+    HPEN null_pen = static_cast<HPEN>(GetStockObject(NULL_PEN));
+    HGDIOBJ old_pen = nullptr;
+    if (null_pen != nullptr) {
+        old_pen = SelectObject(paint_dc, null_pen);
+    }
+    auto draw_indicator_layer = [&](const int expand, const COLORREF color) {
+        RECT layer = recording_indicator_rect_;
+        layer.left -= expand;
+        layer.top -= expand;
+        layer.right += expand;
+        layer.bottom += expand;
+        HBRUSH layer_brush = CreateSolidBrush(color);
+        if (layer_brush == nullptr) {
+            return;
+        }
+        HGDIOBJ old_brush = SelectObject(paint_dc, layer_brush);
+        Ellipse(paint_dc, layer.left, layer.top, layer.right, layer.bottom);
+        SelectObject(paint_dc, old_brush);
+        DeleteObject(layer_brush);
+    };
+    draw_indicator_layer(4, glow_outer_color);
+    draw_indicator_layer(2, glow_mid_color);
+    draw_indicator_layer(0, core_color);
+    if (old_pen != nullptr) {
+        SelectObject(paint_dc, old_pen);
+    }
 
     if (!using_dwm_thumbnail_ && preview_dc_ != nullptr && preview_width_ > 0 && preview_height_ > 0) {
         StretchBlt(paint_dc, preview_rect_.left + 1, preview_rect_.top + 1,
@@ -954,6 +1012,7 @@ void MainWindow::UpdateControlState() {
     EnableWindow(refresh_button_, !is_recording && window_mode);
     EnableWindow(start_stop_button_, is_recording || !window_mode || has_primary_source);
     SetWindowTextW(start_stop_button_, is_recording ? L"Stop" : L"Start");
+    InvalidateRect(hwnd_, &recording_indicator_rect_, FALSE);
 }
 
 void MainWindow::UpdateStatus(const std::wstring& text) {

@@ -3,8 +3,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <fstream>
 #include <thread>
+
+#include "common/logger.h"
 
 namespace wcs::capture {
 
@@ -49,69 +52,84 @@ bool ScreenRecorder::Start(const std::filesystem::path& video_path,
     if (running_.load()) {
         return false;
     }
+    try {
+        wcs::common::log::Info("ScreenRecorder Start");
 
-    video_path_ = video_path;
-    video_meta_path_ = video_meta_path;
-    anchor_ = utc_anchor;
-    options_ = options;
-    if (options_.sources.empty()) {
-        options_.sources.push_back(options_.source);
-    }
-    frame_count_.store(0);
-    dropped_frames_.store(0);
-    start_qpc_.store(0);
-    stop_requested_.store(false);
-
-    uint32_t source_width = 0;
-    uint32_t source_height = 0;
-    if (!ResolveCompositeSize(options_.sources, &source_width, &source_height)) {
-        return false;
-    }
-
-    width_ = options_.width > 0 ? options_.width : source_width;
-    height_ = options_.height > 0 ? options_.height : source_height;
-    width_ = MakeEvenDimension(width_);
-    height_ = MakeEvenDimension(height_);
-    if (width_ == 0 || height_ == 0) {
-        return false;
-    }
-    stride_ = width_ * 4;
-
-    if (!InitGdi()) {
-        ReleaseGdi();
-        return false;
-    }
-
-    use_wgc_ = false;
-    wgc_grabber_.reset();
-    if (options_.sources.size() == 1) {
-        auto grabber = std::make_unique<WgcFrameGrabber>();
-        if (grabber->Start(options_.sources.front(), width_, height_)) {
-            use_wgc_ = true;
-            wgc_grabber_ = std::move(grabber);
+        video_path_ = video_path;
+        video_meta_path_ = video_meta_path;
+        anchor_ = utc_anchor;
+        options_ = options;
+        if (options_.sources.empty()) {
+            options_.sources.push_back(options_.source);
         }
-    }
+        frame_count_.store(0);
+        dropped_frames_.store(0);
+        start_qpc_.store(0);
+        stop_requested_.store(false);
 
-    wcs::encode::MfH264Encoder::Options encode_options{};
-    encode_options.width = width_;
-    encode_options.height = height_;
-    encode_options.fps = options_.fps;
-    encode_options.bitrate = options_.bitrate;
-    encode_options.codec = options_.codec;
-    if (!encoder_.Start(video_path_, encode_options)) {
-        ReleaseGdi();
-        return false;
-    }
+        uint32_t source_width = 0;
+        uint32_t source_height = 0;
+        if (!ResolveCompositeSize(options_.sources, &source_width, &source_height)) {
+            wcs::common::log::Error("ScreenRecorder ResolveCompositeSize failed");
+            return false;
+        }
 
-    running_.store(true);
-    capture_thread_ = std::thread(&ScreenRecorder::CaptureThreadMain, this);
-    return true;
+        width_ = options_.width > 0 ? options_.width : source_width;
+        height_ = options_.height > 0 ? options_.height : source_height;
+        width_ = MakeEvenDimension(width_);
+        height_ = MakeEvenDimension(height_);
+        if (width_ == 0 || height_ == 0) {
+            wcs::common::log::Error("ScreenRecorder invalid output dimension");
+            return false;
+        }
+        stride_ = width_ * 4;
+
+        if (!InitGdi()) {
+            wcs::common::log::Error("ScreenRecorder InitGdi failed");
+            ReleaseGdi();
+            return false;
+        }
+
+        use_wgc_ = false;
+        wgc_grabber_.reset();
+        if (options_.sources.size() == 1) {
+            auto grabber = std::make_unique<WgcFrameGrabber>();
+            if (grabber->Start(options_.sources.front(), width_, height_)) {
+                use_wgc_ = true;
+                wgc_grabber_ = std::move(grabber);
+            }
+        }
+
+        wcs::encode::MfH264Encoder::Options encode_options{};
+        encode_options.width = width_;
+        encode_options.height = height_;
+        encode_options.fps = options_.fps;
+        encode_options.bitrate = options_.bitrate;
+        encode_options.codec = options_.codec;
+        if (!encoder_.Start(video_path_, encode_options)) {
+            wcs::common::log::Error("ScreenRecorder encoder start failed");
+            ReleaseGdi();
+            return false;
+        }
+
+        running_.store(true);
+        capture_thread_ = std::thread(&ScreenRecorder::CaptureThreadMain, this);
+        wcs::common::log::Info("ScreenRecorder started");
+        return true;
+    } catch (const std::exception& ex) {
+        wcs::common::log::Error(std::string("ScreenRecorder Start exception: ") + ex.what());
+    } catch (...) {
+        wcs::common::log::Error("ScreenRecorder Start unknown exception");
+    }
+    ReleaseGdi();
+    return false;
 }
 
 void ScreenRecorder::Stop() {
     if (!running_.load()) {
         return;
     }
+    wcs::common::log::Info("ScreenRecorder stopping");
 
     stop_requested_.store(true);
     if (capture_thread_.joinable()) {
@@ -127,6 +145,7 @@ void ScreenRecorder::Stop() {
     WriteVideoMeta();
     use_wgc_ = false;
     running_.store(false);
+    wcs::common::log::Info("ScreenRecorder stopped");
 }
 
 bool ScreenRecorder::InitGdi() {
@@ -179,70 +198,86 @@ void ScreenRecorder::ReleaseGdi() {
 }
 
 void ScreenRecorder::CaptureThreadMain() {
-    const int64_t qpc_freq = anchor_.qpc_freq;
-    const int64_t frame_interval_qpc =
-        options_.fps > 0 ? (qpc_freq / static_cast<int64_t>(options_.fps)) : 0;
-    const int64_t default_frame_duration_100ns =
-        options_.fps > 0 ? (kHundredNsPerSecond / static_cast<int64_t>(options_.fps))
-                         : (kHundredNsPerSecond / 60);
+    try {
+        const int64_t qpc_freq = anchor_.qpc_freq;
+        const int64_t frame_interval_qpc =
+            options_.fps > 0 ? (qpc_freq / static_cast<int64_t>(options_.fps)) : 0;
+        const int64_t default_frame_duration_100ns =
+            options_.fps > 0 ? (kHundredNsPerSecond / static_cast<int64_t>(options_.fps))
+                             : (kHundredNsPerSecond / 60);
 
-    const int64_t local_start_qpc = wcs::time::QpcClock::NowTicks();
-    start_qpc_.store(local_start_qpc);
-    int64_t previous_sample_time = 0;
-    int64_t next_tick = local_start_qpc;
+        const int64_t local_start_qpc = wcs::time::QpcClock::NowTicks();
+        start_qpc_.store(local_start_qpc);
+        int64_t previous_sample_time = 0;
+        int64_t next_tick = local_start_qpc;
+        uint32_t consecutive_capture_failures = 0;
 
-    while (!stop_requested_.load()) {
-        bool captured = false;
-        if (use_wgc_ && wgc_grabber_) {
-            const int wait_timeout_ms =
-                options_.fps > 0 ? (std::max)(1, static_cast<int>(1000 / options_.fps)) : 16;
-            captured = wgc_grabber_->CopyLatestFrame(static_cast<uint8_t*>(dib_bits_), stride_, width_,
-                                                     height_, wait_timeout_ms);
-        } else {
-            captured = CaptureSourcesToDc(options_.sources, mem_dc_, static_cast<int>(width_),
-                                          static_cast<int>(height_));
-        }
-
-        if (!captured) {
-            dropped_frames_.fetch_add(1);
-            continue;
-        }
-
-        const int64_t frame_qpc = wcs::time::QpcClock::NowTicks();
-        const int64_t sample_time_100ns =
-            (frame_qpc - local_start_qpc) * kHundredNsPerSecond / qpc_freq;
-        int64_t sample_duration_100ns = sample_time_100ns - previous_sample_time;
-        if (sample_duration_100ns <= 0) {
-            sample_duration_100ns = default_frame_duration_100ns;
-        }
-        previous_sample_time = sample_time_100ns;
-
-        const bool ok = encoder_.WriteFrame(static_cast<const uint8_t*>(dib_bits_), stride_,
-                                            sample_time_100ns, sample_duration_100ns);
-        if (ok) {
-            frame_count_.fetch_add(1);
-        } else {
-            dropped_frames_.fetch_add(1);
-        }
-
-        if (frame_interval_qpc <= 0) {
-            continue;
-        }
-
-        next_tick += frame_interval_qpc;
-        int64_t now = wcs::time::QpcClock::NowTicks();
-        int64_t remaining_ticks = next_tick - now;
-        if (remaining_ticks > 0) {
-            const int64_t remaining_ms = (remaining_ticks * 1000) / qpc_freq;
-            if (remaining_ms > 1) {
-                Sleep(static_cast<DWORD>(remaining_ms - 1));
+        while (!stop_requested_.load()) {
+            bool captured = false;
+            if (use_wgc_ && wgc_grabber_) {
+                const int wait_timeout_ms =
+                    options_.fps > 0 ? (std::max)(1, static_cast<int>(1000 / options_.fps)) : 16;
+                captured = wgc_grabber_->CopyLatestFrame(static_cast<uint8_t*>(dib_bits_), stride_,
+                                                         width_, height_, wait_timeout_ms);
+            } else {
+                captured = CaptureSourcesToDc(options_.sources, mem_dc_, static_cast<int>(width_),
+                                              static_cast<int>(height_));
             }
-            while (wcs::time::QpcClock::NowTicks() < next_tick) {
-                std::this_thread::yield();
+
+            if (!captured) {
+                dropped_frames_.fetch_add(1);
+                ++consecutive_capture_failures;
+                if (consecutive_capture_failures == 120) {
+                    wcs::common::log::Warning(
+                        "ScreenRecorder frame capture failed 120 consecutive times");
+                    consecutive_capture_failures = 0;
+                }
+                continue;
             }
-        } else {
-            next_tick = now;
+            consecutive_capture_failures = 0;
+
+            const int64_t frame_qpc = wcs::time::QpcClock::NowTicks();
+            const int64_t sample_time_100ns =
+                (frame_qpc - local_start_qpc) * kHundredNsPerSecond / qpc_freq;
+            int64_t sample_duration_100ns = sample_time_100ns - previous_sample_time;
+            if (sample_duration_100ns <= 0) {
+                sample_duration_100ns = default_frame_duration_100ns;
+            }
+            previous_sample_time = sample_time_100ns;
+
+            const bool ok = encoder_.WriteFrame(static_cast<const uint8_t*>(dib_bits_), stride_,
+                                                sample_time_100ns, sample_duration_100ns);
+            if (ok) {
+                frame_count_.fetch_add(1);
+            } else {
+                dropped_frames_.fetch_add(1);
+            }
+
+            if (frame_interval_qpc <= 0) {
+                continue;
+            }
+
+            next_tick += frame_interval_qpc;
+            int64_t now = wcs::time::QpcClock::NowTicks();
+            int64_t remaining_ticks = next_tick - now;
+            if (remaining_ticks > 0) {
+                const int64_t remaining_ms = (remaining_ticks * 1000) / qpc_freq;
+                if (remaining_ms > 1) {
+                    Sleep(static_cast<DWORD>(remaining_ms - 1));
+                }
+                while (wcs::time::QpcClock::NowTicks() < next_tick) {
+                    std::this_thread::yield();
+                }
+            } else {
+                next_tick = now;
+            }
         }
+    } catch (const std::exception& ex) {
+        wcs::common::log::Error(std::string("ScreenRecorder capture thread exception: ") + ex.what());
+        stop_requested_.store(true);
+    } catch (...) {
+        wcs::common::log::Error("ScreenRecorder capture thread unknown exception");
+        stop_requested_.store(true);
     }
 }
 

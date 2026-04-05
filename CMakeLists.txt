@@ -36,6 +36,8 @@ set(SRC_FILES
     src/capture/wgc_frame_grabber.cpp
     src/capture/screen_recorder.cpp
     src/encode/mf_h264_encoder.cpp
+    src/common/logger.cpp
+    src/common/runtime_diagnostics.cpp
 )
 
 add_executable(WinCaptureSync WIN32 ${SRC_FILES})
@@ -53,6 +55,7 @@ target_link_libraries(WinCaptureSync PRIVATE
     mfuuid
     xinput
     windowsapp
+    dbghelp
 )
 
 if(MSVC)

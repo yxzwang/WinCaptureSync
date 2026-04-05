@@ -78,6 +78,7 @@ private:
     HWND recording_duration_value_ = nullptr;
     HWND status_label_ = nullptr;
     HWND hotkey_label_ = nullptr;
+    RECT recording_indicator_rect_{};
 
     RECT preview_rect_{};
     HDC preview_dc_ = nullptr;

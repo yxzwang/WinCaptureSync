@@ -1,10 +1,13 @@
 #include "main/app_controller.h"
 
 #include <filesystem>
+#include <exception>
 #include <memory>
 #include <sstream>
 #include <utility>
 #include <vector>
+
+#include "common/logger.h"
 
 namespace wcs::mainapp {
 
@@ -39,20 +42,24 @@ AppController::~AppController() {
 }
 
 bool AppController::Initialize(HWND hotkey_target) {
+    wcs::common::log::Info("AppController Initialize");
     std::error_code ec;
     std::filesystem::create_directories(config_.output_root, ec);
     if (ec) {
+        wcs::common::log::Error("Failed to create output directory: " + config_.output_root.string());
         SetStatus(L"Failed to create output directory");
         state_ = RecorderState::Error;
         return false;
     }
 
     if (!RegisterHotkey(hotkey_target)) {
+        wcs::common::log::Error("Register hotkey failed");
         state_ = RecorderState::Error;
         return false;
     }
 
     SetStatus(L"Ready");
+    wcs::common::log::Info("AppController initialized");
     return true;
 }
 
@@ -79,101 +86,119 @@ bool AppController::StartRecording() {
         return false;
     }
 
-    state_ = RecorderState::Arming;
-    anchor_ = wcs::time::QpcClock::SampleUtcAnchor();
-    session_paths_ = CreateSessionPaths(config_.output_root);
+    try {
+        state_ = RecorderState::Arming;
+        anchor_ = wcs::time::QpcClock::SampleUtcAnchor();
+        session_paths_ = CreateSessionPaths(config_.output_root);
+        wcs::common::log::Info("StartRecording arming session: " + session_paths_.session_dir.string());
 
-    std::error_code ec;
-    std::filesystem::create_directories(session_paths_.session_dir, ec);
-    if (ec) {
-        SetStatus(L"Failed to create session directory");
-        state_ = RecorderState::Error;
-        return false;
-    }
+        std::error_code ec;
+        std::filesystem::create_directories(session_paths_.session_dir, ec);
+        if (ec) {
+            wcs::common::log::Error("Failed to create session directory: " +
+                                    session_paths_.session_dir.string());
+            SetStatus(L"Failed to create session directory");
+            state_ = RecorderState::Error;
+            return false;
+        }
 
-    std::vector<wcs::capture::CaptureSource> sources = capture_sources_;
-    if (sources.empty()) {
-        sources.push_back(wcs::capture::CaptureSource{});
-    }
+        std::vector<wcs::capture::CaptureSource> sources = capture_sources_;
+        if (sources.empty()) {
+            sources.push_back(wcs::capture::CaptureSource{});
+        }
 
-    for (const auto& source : sources) {
-        if (source.type == wcs::capture::CaptureSourceType::Window) {
-            if (source.window == nullptr || !IsWindow(source.window)) {
-                SetStatus(L"Selected window is not valid");
+        for (const auto& source : sources) {
+            if (source.type == wcs::capture::CaptureSourceType::Window) {
+                if (source.window == nullptr || !IsWindow(source.window)) {
+                    wcs::common::log::Warning("Selected window source is invalid");
+                    SetStatus(L"Selected window is not valid");
+                    state_ = RecorderState::Idle;
+                    return false;
+                }
+            }
+        }
+
+        wcs::capture::ScreenRecorder::Options capture_options{};
+        capture_options.fps = config_.capture_fps;
+        capture_options.bitrate = config_.capture_bitrate;
+        capture_options.codec = ToEncoderCodec(config_.capture_codec);
+
+        wcs::input::InputRecorder::Options input_options{};
+        input_options.queue_capacity = config_.input_queue_capacity;
+        input_options.batch_size = config_.input_batch_size;
+        input_options.flush_interval_ms = config_.input_flush_interval_ms;
+        input_options.diagnostic_mode = config_.input_diagnostic_mode;
+
+        screen_recorders_.clear();
+
+        for (size_t i = 0; i < sources.size(); ++i) {
+            auto recorder = std::make_unique<wcs::capture::ScreenRecorder>();
+            auto source_capture_options = capture_options;
+            if (i == 0) {
+                source_capture_options.width = config_.capture_primary_width;
+                source_capture_options.height = config_.capture_primary_height;
+            } else if (i == 1) {
+                source_capture_options.width = config_.capture_secondary_width;
+                source_capture_options.height = config_.capture_secondary_height;
+            } else {
+                source_capture_options.width = config_.capture_primary_width;
+                source_capture_options.height = config_.capture_primary_height;
+            }
+            source_capture_options.source = sources[i];
+            source_capture_options.sources.clear();
+            source_capture_options.sources.push_back(sources[i]);
+
+            const auto video_path = VideoPathForSourceIndex(session_paths_, i);
+            const auto video_meta_path = VideoMetaPathForSourceIndex(session_paths_, i);
+            const bool screen_ok =
+                recorder->Start(video_path, video_meta_path, anchor_, source_capture_options);
+            if (!screen_ok) {
+                wcs::common::log::Error("Screen recorder start failed for source index=" +
+                                        std::to_string(i));
+                for (auto& started_recorder : screen_recorders_) {
+                    started_recorder->Stop();
+                }
+                screen_recorders_.clear();
+                SetStatus(L"Screen recorder start failed");
                 state_ = RecorderState::Idle;
                 return false;
             }
+
+            screen_recorders_.push_back(std::move(recorder));
         }
-    }
 
-    wcs::capture::ScreenRecorder::Options capture_options{};
-    capture_options.fps = config_.capture_fps;
-    capture_options.bitrate = config_.capture_bitrate;
-    capture_options.codec = ToEncoderCodec(config_.capture_codec);
-
-    wcs::input::InputRecorder::Options input_options{};
-    input_options.queue_capacity = config_.input_queue_capacity;
-    input_options.batch_size = config_.input_batch_size;
-    input_options.flush_interval_ms = config_.input_flush_interval_ms;
-    input_options.diagnostic_mode = config_.input_diagnostic_mode;
-
-    screen_recorders_.clear();
-
-    for (size_t i = 0; i < sources.size(); ++i) {
-        auto recorder = std::make_unique<wcs::capture::ScreenRecorder>();
-        auto source_capture_options = capture_options;
-        if (i == 0) {
-            source_capture_options.width = config_.capture_primary_width;
-            source_capture_options.height = config_.capture_primary_height;
-        } else if (i == 1) {
-            source_capture_options.width = config_.capture_secondary_width;
-            source_capture_options.height = config_.capture_secondary_height;
-        } else {
-            source_capture_options.width = config_.capture_primary_width;
-            source_capture_options.height = config_.capture_primary_height;
-        }
-        source_capture_options.source = sources[i];
-        source_capture_options.sources.clear();
-        source_capture_options.sources.push_back(sources[i]);
-
-        const auto video_path = VideoPathForSourceIndex(session_paths_, i);
-        const auto video_meta_path = VideoMetaPathForSourceIndex(session_paths_, i);
-        const bool screen_ok =
-            recorder->Start(video_path, video_meta_path, anchor_, source_capture_options);
-        if (!screen_ok) {
-            for (auto& started_recorder : screen_recorders_) {
-                started_recorder->Stop();
+        const bool input_ok = input_recorder_.Start(session_paths_.input_path, anchor_, input_options);
+        if (!input_ok) {
+            wcs::common::log::Error("Input recorder start failed");
+            for (auto& recorder : screen_recorders_) {
+                recorder->Stop();
             }
             screen_recorders_.clear();
-            SetStatus(L"Screen recorder start failed");
+            SetStatus(L"Input recorder start failed");
             state_ = RecorderState::Idle;
             return false;
         }
 
-        screen_recorders_.push_back(std::move(recorder));
-    }
-
-    const bool input_ok = input_recorder_.Start(session_paths_.input_path, anchor_, input_options);
-    if (!input_ok) {
+        const int64_t input_start_qpc = input_recorder_.StartQpc();
         for (auto& recorder : screen_recorders_) {
-            recorder->Stop();
+            recorder->SetInputStartQpc(input_start_qpc);
         }
-        screen_recorders_.clear();
-        SetStatus(L"Input recorder start failed");
-        state_ = RecorderState::Idle;
-        return false;
+        state_ = RecorderState::Recording;
+
+        std::wstringstream ss;
+        ss << L"Recording: " << session_paths_.session_dir.wstring();
+        SetStatus(ss.str());
+        wcs::common::log::Info("Recording started");
+        return true;
+    } catch (const std::exception& ex) {
+        wcs::common::log::Error(std::string("StartRecording exception: ") + ex.what());
+    } catch (...) {
+        wcs::common::log::Error("StartRecording unknown exception");
     }
 
-    const int64_t input_start_qpc = input_recorder_.StartQpc();
-    for (auto& recorder : screen_recorders_) {
-        recorder->SetInputStartQpc(input_start_qpc);
-    }
-    state_ = RecorderState::Recording;
-
-    std::wstringstream ss;
-    ss << L"Recording: " << session_paths_.session_dir.wstring();
-    SetStatus(ss.str());
-    return true;
+    SetStatus(L"Start recording failed (exception)");
+    state_ = RecorderState::Idle;
+    return false;
 }
 
 void AppController::StopRecording() {
@@ -181,21 +206,31 @@ void AppController::StopRecording() {
         return;
     }
 
-    state_ = RecorderState::Stopping;
-    input_recorder_.Stop();
-    const int64_t input_start_qpc = input_recorder_.StartQpc();
-    for (auto& recorder : screen_recorders_) {
-        recorder->SetInputStartQpc(input_start_qpc);
-    }
-    for (auto& recorder : screen_recorders_) {
-        recorder->Stop();
-    }
-    screen_recorders_.clear();
+    try {
+        wcs::common::log::Info("StopRecording begin");
+        state_ = RecorderState::Stopping;
+        input_recorder_.Stop();
+        const int64_t input_start_qpc = input_recorder_.StartQpc();
+        for (auto& recorder : screen_recorders_) {
+            recorder->SetInputStartQpc(input_start_qpc);
+        }
+        for (auto& recorder : screen_recorders_) {
+            recorder->Stop();
+        }
+        screen_recorders_.clear();
 
-    std::wstringstream ss;
-    ss << L"Saved: " << session_paths_.session_dir.wstring();
-    SetStatus(ss.str());
-    state_ = RecorderState::Idle;
+        std::wstringstream ss;
+        ss << L"Saved: " << session_paths_.session_dir.wstring();
+        SetStatus(ss.str());
+        state_ = RecorderState::Idle;
+        wcs::common::log::Info("StopRecording completed");
+    } catch (const std::exception& ex) {
+        wcs::common::log::Error(std::string("StopRecording exception: ") + ex.what());
+        state_ = RecorderState::Error;
+    } catch (...) {
+        wcs::common::log::Error("StopRecording unknown exception");
+        state_ = RecorderState::Error;
+    }
 }
 
 void AppController::SetCaptureSources(const std::vector<wcs::capture::CaptureSource>& sources) {

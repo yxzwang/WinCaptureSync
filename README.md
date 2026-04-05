@@ -176,6 +176,16 @@ input_diagnostic_mode=1
 
 When enabled, an additional file `input_diag.jsonl` is created per session, containing raw registration info and per-message diagnostic data. This is useful for debugging cases where specific games fail to send expected mouse events.
 
+## Stability And Crash Diagnostics
+
+The app now includes process-level crash diagnostics and runtime logs.
+
+- Runtime log file: `./logs/wincapturesync_<timestamp>_<pid>.log`
+- Crash dump file (on unhandled crash): `./logs/crash_<timestamp>_<pid>.dmp`
+
+Logs record critical lifecycle stages and recorder start/stop failures.  
+The dump file can be opened with Visual Studio or WinDbg for root-cause analysis.
+
 ## Gamepad Input Recording
 
 Gamepad input is recorded through `XInput` and written into the same `input.jsonl`.

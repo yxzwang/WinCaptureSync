@@ -1,6 +1,11 @@
 #include <Windows.h>
 #include <objbase.h>
 
+#include <exception>
+#include <string>
+
+#include "common/logger.h"
+#include "common/runtime_diagnostics.h"
 #include "gui/main_window.h"
 
 namespace {
@@ -23,19 +28,39 @@ void EnableDpiAwareness() {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
+    wcs::common::log::InitializeDefault();
+    wcs::common::runtime::InstallCrashHandlers();
+    wcs::common::log::Info("Application start");
+
     EnableDpiAwareness();
     const HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
+        wcs::common::log::Error("CoInitializeEx failed");
+        wcs::common::log::Shutdown();
         return 1;
     }
 
-    wcs::gui::MainWindow window(instance);
-    if (!window.CreateAndShow(show_cmd)) {
-        CoUninitialize();
-        return 1;
+    int code = 0;
+    try {
+        wcs::gui::MainWindow window(instance);
+        if (!window.CreateAndShow(show_cmd)) {
+            wcs::common::log::Error("Main window create/show failed");
+            CoUninitialize();
+            wcs::common::log::Shutdown();
+            return 1;
+        }
+
+        code = window.Run();
+    } catch (const std::exception& ex) {
+        wcs::common::log::Fatal(std::string("Unhandled exception in main loop: ") + ex.what());
+        code = 1;
+    } catch (...) {
+        wcs::common::log::Fatal("Unhandled unknown exception in main loop");
+        code = 1;
     }
 
-    const int code = window.Run();
     CoUninitialize();
+    wcs::common::log::Info("Application exit code=" + std::to_string(code));
+    wcs::common::log::Shutdown();
     return code;
 }
